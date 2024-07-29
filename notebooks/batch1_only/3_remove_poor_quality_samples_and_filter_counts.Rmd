@@ -1,0 +1,194 @@
+---
+title: "Remove Poor Quality Samples and Filter Counts"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen  
+Date: 5.15.24
+
+I prepared a counts matrix and a metadata table. Here I will investigate them and remove samples that are poor quality. Prior to removing, I will first filter counts so that only expressed protein coding genes are analyzed in subsequent analysis. 
+
+We will evaluate this in the following way:
+1) Determine if the count distribution for each sample is roughly the same. 
+2) If not, determine if there are any library low-count size outliers. Remove and look at distributions again. 
+3) Determine if any samples have NA values. 
+
+### Setup 
+
+Packages
+```{r, echo=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+```
+
+Load in the "three tables" - cts|metadata|genes
+```{r}
+cts <- readRDS("data/kallisto.gene-level.lengthScaledTPM_batch1.rds")
+sample_info <- readRDS("data/metadata_batch1_with-covariates.rds")
+gtf <- rtracklayer::readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+```
+
+### Square Samples between cts and sample_info
+We removed some samples in the "2_collect_covariates" notebook because Haley said they are bad. We need to remove these samples from the counts matrix. 
+```{r}
+cts <- cts[,row.names(sample_info)]
+
+#this will print true if they align:
+all(colnames(cts) == rownames(sample_info))
+```
+
+### Filter Counts
+1. Extract only the protein coding genes
+```{r}
+#extract protein coding genes. I checked and this entire pipe works. 
+pc_gene_ids <- plyranges::filter(gtf, type == 'gene', gene_biotype == 'protein_coding') %>% as.data.frame() %>% dplyr::select(gene_id, gene_name)
+
+#select rows that match the protein coding gene
+filtered_cts_pc_only <- cts[pc_gene_ids$gene_id, ]
+
+#verify this worked - both of these should print TRUE
+all(rownames(filtered_cts_pc_only) == pc_gene_ids$gene_id)
+nrow(filtered_cts_pc_only) == nrow(pc_gene_ids)
+```
+
+Since we have the symbol and ensembl ids now, merge them together and set as rownames. 
+```{r}
+pc_gene_ids[, 3] <- unite(pc_gene_ids, "merged_id", gene_id:gene_name, sep = "_")
+rownames(filtered_cts_pc_only) <- pc_gene_ids$merged_id
+```
+
+2. remove low count data by voom-transformed row medians > 1.5
+```{r}
+#set up dgelist
+tmp <- DGEList(filtered_cts_pc_only)
+#calculate norm factors
+tmp <- calcNormFactors(tmp)
+#voom transform, this requires a design, which can be ~1. This gives the same genes below if a real model is used (I checked). 
+tmp_design <- model.matrix(~1, data = sample_info)
+tmp <- voom(tmp, tmp_design, plot = F)
+
+#filter genes based on voom-transformed row medians > 1.5. This is equivalent to 10^1.5 = 31.6 raw counts. This is much more stringent.  
+keep <- data.frame(medians = apply(tmp$E, 1, median)) %>% dplyr::filter(medians > 1.5)
+filtered_cts <- filtered_cts_pc_only[row.names(keep), ]
+
+#remove tmp objects
+rm(tmp, tmp_design)
+
+#report how much was lost
+print('total features remaining')
+nrow(filtered_cts)
+print('total features removed') 
+nrow(filtered_cts_pc_only) - nrow(filtered_cts)
+```
+
+### Identify Bad Samples 
+
+#### Normalized count distribution
+
+In order for the data to be modeled properly, we assume all samples have a similar distribution of normalized counts. Lets see if there are any outliers. 
+
+Voom Transform
+```{r}
+#set up dgelist
+dge <- DGEList(filtered_cts)
+
+#calculate norm factors
+dge <- calcNormFactors(dge)
+
+#voom transform, this requires a design, which can be ~1 since we are only doing voom transformations, not modeling yet.  
+design_base <- model.matrix(~1, data = sample_info)
+v <- voom(dge, design_base, plot = F)
+```
+
+Create df of voom counts with gene, sample, and counts as columns
+```{r}
+voom_counts_df <- as.data.frame(v$E) %>% rownames_to_column("gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+```
+
+Plot
+```{r}
+vc_dist <- ggplot(voom_counts_df, aes(x=counts, group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+vc_dist
+```
+
+Looks like we have one outlier. It is probably a library size outlier. Let's check.
+
+#### Library size outliers
+
+Plot library size
+```{r}
+lib <- dge$samples %>% as.data.frame()
+lib_text <- rownames_to_column(lib) %>% dplyr::top_n(n = -1, wt = lib.size)
+
+ggplot(data=lib, aes(x=log10(lib.size))) +
+    geom_histogram(binwidth = 0.05, color = "grey", fill = "ivory") +
+    geom_jitter(color = "black", alpha = 0.5, aes(y = 0), height = 5) +
+    geom_text(data = lib_text, aes(x=log10(lib.size), label = rowname, y = 1), size = 3, angle = 90, hjust = -0.1) +
+    theme_bw() +
+    ylab("count") +
+    theme(legend.position = "none")
+```
+
+We have one library low-count outlier. Let's remove these samples. 
+```{r}
+bad_samples <- lib_text$rowname
+filtered_cts_goodSamples <- filtered_cts[, -which(colnames(filtered_cts) %in% bad_samples)]
+
+#verify this worked, this should print 1. 
+ncol(filtered_cts) - ncol(filtered_cts_goodSamples)
+```
+
+Remove them from the sample_info file. 
+```{r}
+sample_info_goodSamples <- sample_info[-which(rownames(sample_info) %in% bad_samples), ]
+
+#verify this worked, this should print 1
+nrow(sample_info) - nrow(sample_info_goodSamples)
+```
+
+#### Recheck count distribution
+
+Let's recheck the count distribution with the good samples. 
+```{r}
+dge <- DGEList(filtered_cts_goodSamples) %>% calcNormFactors()
+
+design_base <- model.matrix(~1, data = sample_info_goodSamples)
+
+v <- voom(dge, design_base, plot = F)
+
+voom_counts_df <- as.data.frame(v$E) %>% rownames_to_column("gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+
+vc_dist_removed <- ggplot(voom_counts_df, aes(x=counts, group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+vc_dist_removed
+```
+
+Great! All of the samples have similar normalized count distributions. Mode looks like ~5 for all samples for genes that met the filters. 
+
+### Check that there are no NAs for any gene or samples.
+```{r}
+#this prints the number of samples that have NAs
+which(is.na(filtered_cts_goodSamples))
+```
+This worked, there are no NA values. We do not have to remove samples from this QC step. 
+
+### Write out the good filtered counts and sample_info
+```{r}
+#cts
+saveRDS(filtered_cts_goodSamples, file = "data/filtered_counts_QCd_samples_batch1.rds")
+
+#sample info
+saveRDS(sample_info_goodSamples, file = "data/metadata_with-covariates_QCd_samples_batch1.rds")
+```
+

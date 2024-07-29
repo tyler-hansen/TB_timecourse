@@ -1,0 +1,85 @@
+---
+title: "Convert kallisto transript level to gene level and join samples"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 11.19.2023 | update 1.24.24 | Update 2.6.2024
+
+We have transcript level data in kallisto files. We need and want to work with TPM at the gene level. This notebook describes converting transcript level to gene level for all relevant files. In addition, in the tximport call, we join all samples and output the converted counts as a dataframe. 
+
+```{r, Libraries, echo=FALSE}
+library(tidyverse)
+library(GenomicFeatures)
+library(tximport)
+library(rhdf5)
+```
+
+```{r, Assign Files}
+# GTF
+GTF <- 'data/Homo_sapiens.GRCh38.87.gtf'
+
+#sample info
+CN <- c("kallisto_number", "Donor_ID", "Timepoint", "Infection(TB/NI)", "MOI", "Location", "Run", "filename", "sample_ID") #column names
+sample_info <- read_tsv("results/metadata.tsv", col_names = CN)
+
+#kallisto files. This uses the filename and sample_ID key-value pair to match the metadata to the counts
+files <- file.path("data/kallisto_TB-relevant", sample_info$filename, "abundance.h5")
+names(files) <- sample_info$filename
+```
+
+
+```{r, make ts2gene object}
+txdb <- makeTxDbFromGFF(GTF,format='gtf')
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+```
+
+```{r, Import Kallisto h5 files}
+# Gene-level lengthScaledTPM
+txi.kallisto.gene_level.lengthScaledTPM <- tximport(files, type = "kallisto", txOut = FALSE, 
+                                                    tx2gene=tx2gene, countsFromAbundance= 'lengthScaledTPM')
+```
+
+```{r, Convert to df}
+df <- as.tibble(txi.kallisto.gene_level.lengthScaledTPM$counts)
+df$gene_id <- row.names(txi.kallisto.gene_level.lengthScaledTPM$counts)  
+df <- relocate(df, gene_id, .before = kallisto_4_AF278_T24_NI_MONTREAL_run2)
+```
+
+```{r, Write}
+# as rds
+saveRDS(txi.kallisto.gene_level.lengthScaledTPM$counts, file = "data/kallisto.gene-level.lengthScaledTPM.rds")
+
+#as tsv
+write_tsv(df, file = "data/kallisto.gene-level.lengthScaledTPM.tsv", col_names = TRUE)
+```
+
+### Update! 
+
+In the metadata generation, we identified a few samples that needed to be duplicated as fill-ins for the counts matrix. In this case we need to duplicate the data in the counts matrix and set the col_name to what was given in the metadata table. 
+
+These are the following: 
+
+"kallisto_10_EU118_T4_NI_run1_duplicated"            "kallisto_12_EU122_T4_NI_run1_duplicated"            "kallisto_13_EU140_T4_NI_run1_duplicated"            "kallisto_14_EU144_T4_NI_run1_duplicated"           
+"kallisto_15_EU148_T4_NI_run1_duplicated"            "kallisto_16_EU238_T4_NI_run1_duplicated"            "kallisto_17_EU02_T4_NI_run1_duplicated"             "kallisto_18_EU03_T4_NI_run1_duplicated"            
+"kallisto_3_AF55_T4_NI_run1_duplicated"              "kallisto_4_AF69_T4_NI_run1_duplicated"              "kallisto_5_AF95_T4_NI_run1_duplicated"              "kallisto_8_AF183_T4_NI_run1_duplicated"             "kallisto_9_AF193_T4_NI_run1_duplicated"             "kallisto_5_AF95_T12_NI_run1_duplicated"             "kallisto_14_EU144_T4_NI_run1_duplicated_duplicated" "kallisto_11_EU262_T30_NI_run2_duplicated"
+
+```{r}
+#make dup_samples list
+dup_samples <- list("kallisto_10_EU118_T4_NI_run1","kallisto_12_EU122_T4_NI_run1","kallisto_13_EU140_T4_NI_run1","kallisto_14_EU144_T4_NI_run1",
+                    "kallisto_15_EU148_T4_NI_run1","kallisto_16_EU238_T4_NI_run1","kallisto_17_EU02_T4_NI_run1","kallisto_18_EU03_T4_NI_run1",
+                    "kallisto_3_AF55_T4_NI_run1","kallisto_4_AF69_T4_NI_run1","kallisto_5_AF95_T4_NI_run1","kallisto_8_AF183_T4_NI_run1",
+                    "kallisto_9_AF193_T4_NI_run1","kallisto_5_AF95_T12_NI_run1","kallisto_11_EU262_T30_NI_run2","kallisto_14_EU144_T4_NI_run1_duplicated")
+
+for (col_name in dup_samples) {
+  new_col_name <- paste0(col_name, "_duplicated")
+  df[[new_col_name]] <- df[[col_name]]
+}
+```
+
+```{r, Write}
+write_tsv(df, file = "data/kallisto.gene-level.lengthScaledTPM.duplicates-included.tsv", col_names = TRUE)
+```
+

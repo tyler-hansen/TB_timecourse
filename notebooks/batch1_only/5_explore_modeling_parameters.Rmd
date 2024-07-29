@@ -1,0 +1,1271 @@
+---
+title: "Explore Modeling Parameters"
+output: html_notebook
+---
+Author: Tyler Hansen
+Date: 5.15.24
+
+Previously, we prepared the data and metadata. Now that we have the right samples and right counts, we need to figure out how to best model the data. This includes identifying which variables are confounding and observing the data when they are confounding. 
+
+We will do the following: 
+1) Check variable balance.
+2) Plot a PCA of uncorrected voom-normalized expression.
+3) Perform an analysis to identify the variance explained by each possible technical confounder.
+4) Test out design matricies to figure out how to best model infeciton effects, popDEs and popDRs. 
+5) Plot a PCA of corrected expression for the various models.
+
+## Setup 
+Packages
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+```
+
+Three tables
+```{r}
+#read in GTF, turn off for now
+#gtf <- rtracklayer::readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+#read in cts
+cts <- readRDS("data/filtered_counts_final_batch1.rds")
+#read in si
+sample_info <- readRDS("data/metadata_final_batch1.rds")
+```
+
+## Check varaible balance
+
+Determine if confounding categorical variables are balanced across experimental using tables. 
+
+Check ancestry
+```{r}
+table(sample_info$ethnicity, sample_info$flow_cell)
+```
+
+They are generally well-balanced. 
+
+Check timepoint
+```{r}
+table(sample_info$Timepoint, sample_info$flow_cell)
+```
+
+Flow cell by timepoint isn't balanced at all, but this should be fine as my analysis will be by timepoint not across timepoints. 
+
+Check Infection
+```{r}
+table(sample_info$Infection, sample_info$flow_cell)
+```
+
+Data is well balanced across conditions.
+
+Check distribution of continuous covariates across important categorical variables
+
+perc_Dups
+```{r}
+ggplot(sample_info, aes(x = perc_Dups, color = ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Dups, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Dups, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+The balance is okay. Perc_Dups is for sure a measure of library quality. I think it is much better estimate than the perc_Aligned and perc_GC. 
+
+perc_Aligned
+```{r}
+ggplot(sample_info, aes(x = perc_Aligned, color = ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Aligned, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Aligned, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+This is not well balanced between Mtb and NI and we should expect that perc_Aligned would decrease for the Mtb samples because they have reads that map to the Mtb genome. So this makes sense. Therefore it wouldn't be a good thing to use as a technical confounder because this difference is not technical. 
+
+perc_GC
+```{r}
+ggplot(sample_info, aes(x = perc_GC, color = ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_GC, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_GC, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+This is not well balanced between Mtb and NI and we should expect that perc_GC might change along that axis since the Mtb genome is likely different GC content than human. So this makes sense. Kind of like perc_Aligned, it wouldn't be a good thing to use as a technical confounder because this difference is not technical. Additionally the difference in GC content is minmal (0.47 vs 0.49) and this should not affect RNA expression that much. 
+
+RNA concentration
+```{r}
+ggplot(sample_info, aes(x = RNA_concentration, color = ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = RNA_concentration, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = RNA_concentration, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+RNA concentration also is not well balanced. However, you can argue it is important for RNA-seq technical differences, so we should include it. 
+
+M_Aligned
+```{r}
+ggplot(sample_info, aes(x = M_Aligned, color = ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = M_Aligned, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = M_Aligned, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+G2M_scores
+```{r}
+ggplot(sample_info, aes(x = G2M_scores, color = ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = G2M_scores, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = G2M_scores, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+S_scores
+```{r}
+ggplot(sample_info, aes(x = S_scores, color = ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = S_scores, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = S_scores, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+The S and G2M scores are hard for me to reason. In one sense we should not expect that cell cycle will be affected by ancestry or the infection and anything else we do is technical. On the other, it has been shown that there may be a cell cycle effect from Mtb where the cell cycle is inhibited in infected cells. Given this conundrum, I think it is best to not include as a technical confounder but instead consider as a tool to test whether cell cycle is confounding later on. 
+
+## Check confounding categorical variables using PCA plots
+
+Voom transform
+```{r}
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+design_base <- model.matrix(~1, sample_info)
+v <- voom(dge, design_base, plot = T)
+```
+
+Calculate PCs
+```{r}
+mat <- as.matrix(v$E) %>% t()
+pcamat <- prcomp(mat)
+```
+
+Plot variance explained by top 20 PCAs
+```{r}
+#variance explained by PCs
+pc_eigenvalues <- pcamat$sdev^2
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), variance = pc_eigenvalues) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+
+ggplot(pc_eigenvalues , aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + coord_cartesian(xlim = c(0,20))
+```
+
+Plot PC1 and PC2 and use color/point type for variables
+```{r, fig.dim=c(9,5)}
+#Prepare df for plotting, just select the first 20 PCs
+pc_scores <- as.data.frame(pcamat$x)[, 1:20] %>% rownames_to_column(var = "filename")
+
+#add metadata
+pc_scores <- rownames_to_column(sample_info, var = "filename") %>% left_join(x = pc_scores, by = "filename")
+
+#relevel infection:
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+```
+
+Plot PC1 vs. PC2 and annotate with infection and other variables
+```{r, fig.height=6, fig.width=7}
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_ancestry
+p_flow
+```
+
+There is a timepoint effect within PC1, but the main effect is NI and Mtb condition. Looks like there may be some ancestry effects as well. 
+
+Let's now do a formal analysis to identify which covariates to include:
+
+## Identify Relevant Technical Confounders
+
+Following the procedure used in Nedelec et al. Cell 2016, identify technical confounders in the filtered dataset. This is not the exact same procedure. It differs at step 5. 
+
+1. Let model_ref denote the reference model with no covariates where only an intercept is estimated for the gene expression data. In addition, model_x is the model with reference model with only one additional covariate "x" and do this for all possible covariates. Estimate the variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models. 
+
+2. For each technical confounder, conduct the following procedure for 200 iterations per gene:
+  a) Permute the entries of the original confounder "x"
+  b) Set up a model_random which is the reference model with the permuted covariate "x"
+  c) Calculate the random variance in expression data explained (v_random) by (SS_ref-SS_random)/SS_ref
+
+3. For each confounder, compare the distribution of v_x of all genes to the distributions of randomized values (v_random) with a Mann-Whitney U test. The shift between the two ditributions at a significance level of p = 0.05 is denoted by delta_x. 
+
+4. Compare the delta_x values for all confounders and chose the technical confounder with the maximum shift, if delta > 0.01, so add to the reference model. 
+
+5. Repeat Steps 1-3 using the updated reference model. After re-evaluating the delta_x values:
+  a) Among the set of confounders present in model_ref, remove the one with the lowest delta value from model_ref, if the shift was below 0.01. 
+  b) Among the set of confounders absent from model_ref, add the one which satisfied the selection procedure described in step 4 to the reference model. 
+
+6. Repeat step 5 until a refernce model is obtained where only the covariats in the model satified the condition in step 4 (i.e., their contribution in explaining the variability in the data is least 1% more than that of an arbitrary random variable). 
+
+### Step 1 - Calculate the observed variance explained
+
+Function to get variance explained for the observed values.
+```{r}
+variance_explained_observed <- function(test_model = "~flow_cell", ref_model = "~1", si, expr_data) {
+  #create models
+  model_ref <- model.matrix(as.formula(ref_model), si)
+  model_test <- model.matrix(as.formula(test_model), si)
+  
+  #fit models
+  fit_ref <- lmFit(expr_data, model_ref)
+  fit_test <-lmFit(expr_data, model_test)
+  
+  #get residual sum of squares for each gene
+  rss_ref <- rowSums(residuals(fit_ref, expr_data$E)^2)
+  rss_test <- rowSums(residuals(fit_test, expr_data$E)^2)
+  
+  #Estimate the variance explained by the technical covariate by (SS_ref-SS_test)/SS_ref. 
+  variance <- (rss_ref - rss_test)/rss_ref
+  return(variance)
+}
+```
+
+Technical Confounders to Measure:
+1. flow_cell
+2. perc_Dups
+3. RNA concentration
+4. M_Aligned (a proxy for amount of mitochondria)
+
+```{r}
+var_fc <- variance_explained_observed("~flow_cell", "~1", sample_info, v)
+var_dups <- variance_explained_observed("~perc_Dups", "~1", sample_info, v)
+var_rna <- variance_explained_observed("~RNA_concentration", "~1", sample_info, v)
+var_mito <- variance_explained_observed("~M_Aligned", "~1", sample_info, v)
+```
+
+### Step 2 - Calculate the random variance explained
+
+#### Part 1 - Permute
+
+Function to permute a variable n times within sample info. Each iteration is saved as an instance in a list. 
+```{r}
+permute_si_vars <- function(permuted_var, si, n) {
+  #permute the variable of interest
+  x <- rsample::permutations(si, permute = all_of(permuted_var), times = n)
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+  for (i in seq(1, n)) {
+    #extract permuted ith iteration
+    si_rand <- x$splits[[i]] %>% rsample::analysis() %>% as.data.frame()
+    
+    #add to list
+    list_x <- rlist::list.append(list_x, si_rand)
+  }
+
+  #return list
+  return(list_x)
+}
+```
+
+Permute variables
+```{r}
+#set seed so random generation is reproducible
+set.seed(1993)
+
+#permute
+fc_perms <- permute_si_vars("flow_cell", sample_info, 200)
+dups_perms <- permute_si_vars("perc_Dups", sample_info, 200)
+rna_perms <- permute_si_vars("RNA_concentration", sample_info, 200)
+mito_perms <- permute_si_vars("M_Aligned", sample_info, 200)
+```
+
+#### Part 2 - estimate random variance from permutations
+
+Function for estimating random variance from permuted data. 
+```{r}
+variance_explained_random <- function(test_model, ref_model, si, expr_data, perms) {
+  
+  #get rss of reference model
+  model_ref <- model.matrix(as.formula(ref_model), si)
+  fit_ref <- lmFit(expr_data, model_ref)
+  rss_ref <- rowSums(residuals(fit_ref, expr_data$E)^2)
+  
+  #run through each each permutation:
+  for (i in seq(1, length(perms))) {
+    #report i, so progress can be assessed
+    message(as.character(i))
+    #set up random model
+    model_rand <- model.matrix(as.formula(test_model), data = as.data.frame(perms[i]))
+    
+    #fit model
+    fit_rand <-lmFit(expr_data, model_rand)
+    
+    #get residual sum of squares for each gene
+    rss_rand <- rowSums(residuals(fit_rand, expr_data$E)^2)
+  
+    #Estimate the variance explained by the technical covariate by (SS_ref-SS_rand)/SS_ref. 
+    variance <- (rss_ref - rss_rand)/rss_ref
+    
+    #parse if n=1 to initalize the dataframe
+    if (i == 1) {
+      df <- as.data.frame(variance)
+      colnames(df) <- as.character(i)
+    }
+    else if (i != 1) {
+      #if rownames are not the same. Stop. 
+      if (all(rownames(df) == rownames(as.data.frame(variance))) == FALSE) {
+        stop("rownames do not match")
+      }
+      df[[as.character(i)]] <- c(variance)
+    }
+  }
+  return(df)
+}
+```
+
+Get random variance - 184.49 sec per function (with tictoc). 
+```{r}
+var_fc_rand <- variance_explained_random("~flow_cell", "~1", sample_info, v, fc_perms)
+var_dups_rand <- variance_explained_random("~perc_Dups", "~1", sample_info, v, dups_perms)
+var_rna_rand <- variance_explained_random("~RNA_concentration", "~1", sample_info, v, rna_perms)
+var_mito_rand <- variance_explained_random("~M_Aligned", "~1", sample_info, v, mito_perms)
+```
+
+### Step 3 - Compare observed and random variances 
+
+For each variable, compare the observed and random variances with a Mann-Whitney U test. Also plot the distributions.  
+
+#### Plot var explained distributions first
+
+Collect variances into one data frame
+```{r}
+#make list of vars to iterate through
+vars <- list("var_fc", "var_dups", "var_rna", "var_mito")
+
+#loop though vars
+for (i in vars){
+  #get variances
+  obs <- get(i) %>% as.data.frame() %>% mutate(var = i, type = "obs")
+  rand <- get(paste0(i, "_rand")) %>% as.matrix() %>% c() %>% as.data.frame() %>% mutate(var = i, type = "random")
+  tmp <- bind_rows(obs, rand)
+  #add to dataframe. Parse to initialize df th first iteration. 
+  if (i=="var_fc") {
+    variance_dataframe <- tmp
+  }
+  else {
+    variance_dataframe <- bind_rows(variance_dataframe, tmp)
+  }
+  rm(obs, rand, tmp)
+}
+```
+
+Plot
+```{r, fig.width=6, fig.height=4}
+variance_dataframe$var <- factor(variance_dataframe$var, levels = rev(c("var_rna", "var_dups", "var_fc", "var_mito")))
+
+variance_plot <- ggplot(variance_dataframe, aes(x = ., y = var, fill = type)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0) +
+  scale_fill_manual(values = c("slateblue","grey80")) +
+  labs(y = "Technical Confounder", 
+       x = "Variance Explained", 
+       title = "Comparing Observed and Random Distributions of\nGene Expression Varaince Explained by Technical Variables",
+       subtitle = "Mref ~ 1") +
+  scale_x_continuous(breaks = seq(0,1,0.1)) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+variance_plot
+
+ggsave("results/batch1_only/variance_explained_technical_confounders.pdf", plot = variance_plot, device = "pdf", width = 6, height = 4)
+```
+
+
+#### Mann-Whitney Test
+
+This function just needs the obs object name to make the comparison. 
+```{r}
+get_delta <- function(var_name = "var_fc") {
+  #get variances
+  obs <- get(var_name) %>% as.matrix()
+  rand <- get(paste0(var_name, "_rand")) %>% as.matrix()
+  
+  #calculate pval for mann-whitney
+  MU_test <- wilcox.test(x = obs, y = rand)
+  
+  #if pval < 0.05, calculate delta by subtracting means and applying absolute value. 
+  if (MU_test$p.val < 0.05) {
+    delta <- abs(mean(obs) - mean(rand))
+    #return delta
+    return(delta)
+  } else {
+    print("not significant")
+  }
+}
+```
+
+Execute functions and output deltas
+```{r}
+#use list from before
+for (i in vars) {
+  tmp <- data.frame(delta = get_delta(i), var = i)
+  if (i=="var_fc") {
+    delta_dataframe <- tmp
+  }
+  else {
+    delta_dataframe <- bind_rows(delta_dataframe, tmp)
+  }
+  rm(tmp)
+}
+```
+
+### Step 4
+Compare the deltas for all confounders and chose the technical confounder with the maximum shift, as long as delta > 0.01, add to the reference model. 
+
+Do this by plotting. 
+Plot
+```{r, fig.width=6, fig.height=4}
+delta_dataframe$var <- factor(delta_dataframe$var, levels = rev(c("var_rna", "var_dups", "var_fc", "var_mito")))
+
+delta_plot <- ggplot(delta_dataframe, aes(x = delta, y = var)) +
+  geom_segment(aes(x=0, xend=delta, y=var, yend=var)) +
+  geom_point(size = 4, color = "slateblue") +
+  geom_text(aes(label = round(delta, 3)), vjust = -0.75, color = "slateblue") +
+  geom_vline(xintercept = 0.01, linetype = "dashed") +
+  labs(y = "Technical Confounder", 
+       x = "Delta (Observed_variance - Random_variance)", 
+       title = "Comparing Delta of Variance Explained\nbetween Observed and Random", 
+       subtitle = "Mref ~ 1") +
+  scale_x_continuous(breaks = seq(0,1,0.05)) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,0.2))
+
+delta_plot
+
+ggsave("results/batch1_only/delta_technical_confounders.pdf", plot = delta_plot, device = "pdf", width = 6, height = 4)
+```
+
+
+RNA has the largest delta. Add to reference model. 
+
+### Step 5
+Repeat Steps 1-3 using the updated reference model. After re-evaluating the delta_x values:
+  a) Among the set of confounders present in model_ref, remove the one with the lowest delta value from model_ref, if the shift was below 0.01. 
+  b) Among the set of confounders absent from model_ref, add the one which satisfied the selection procedure described in step 4 to the reference model. 
+
+#### Calculate the observed variance explained with updated model
+
+```{r}
+ref_arg <- "~RNA_concentration"
+var_fc <- variance_explained_observed(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v)
+var_dups <- variance_explained_observed(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v)
+var_rna <- variance_explained_observed(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v)
+var_mito <- variance_explained_observed(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v)
+```
+
+#### Calculate the random variance explained
+
+Get random variance.  
+```{r}
+var_fc_rand <- variance_explained_random(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v, fc_perms)
+var_dups_rand <- variance_explained_random(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v, dups_perms)
+var_rna_rand <- variance_explained_random(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v, rna_perms)
+var_mito_rand <- variance_explained_random(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v, mito_perms)
+```
+
+#### Compare observed and random variances 
+
+Get deltas. 
+```{r}
+#use list from before
+for (i in vars) {
+  tmp <- data.frame(delta = get_delta(i), var = i)
+  if (i=="var_fc") {
+    delta_dataframe <- tmp
+  }
+  else {
+    delta_dataframe <- bind_rows(delta_dataframe, tmp)
+  }
+  rm(tmp)
+}
+```
+
+Plot
+```{r, fig.width=6, fig.height=4}
+delta_dataframe$var <- factor(delta_dataframe$var, levels = rev(c("var_rna", "var_dups", "var_fc", "var_mito")))
+
+delta_plot <- ggplot(delta_dataframe, aes(x = delta, y = var)) +
+  geom_segment(aes(x=0, xend=delta, y=var, yend=var)) +
+  geom_point(size = 4, color = "pink1") +
+  geom_text(aes(label = round(delta, 3)), vjust = -0.75, color = "pink1") +
+  geom_vline(xintercept = 0.01, linetype = "dashed") +
+  labs(y = "Technical Confounder", 
+       x = "Delta (Observed_variance - Random_variance)", 
+       title = "Comparing Delta of Variance Explained\nbetween Observed and Random", 
+       subtitle = "Mref ~ RNA_concentration") +
+  scale_x_continuous(breaks = seq(0,1,0.05)) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,0.2))
+
+delta_plot
+```
+
+Add perc_Dups to model. Repeat
+
+### Step 6
+Repeat step 5 until a refernce model is obtained where only the covariats in the model satified the condition in step 4. 
+
+Get variances and get deltas
+```{r}
+ref_arg <- "~RNA_concentration+perc_Dups"
+
+var_fc <- variance_explained_observed(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v)
+var_dups <- variance_explained_observed(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v)
+var_rna <- variance_explained_observed(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v)
+var_mito <- variance_explained_observed(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v)
+
+var_fc_rand <- variance_explained_random(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v, fc_perms)
+var_dups_rand <- variance_explained_random(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v, dups_perms)
+var_rna_rand <- variance_explained_random(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v, rna_perms)
+var_mito_rand <- variance_explained_random(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v, mito_perms)
+
+#use list from before
+for (i in vars) {
+  tmp <- data.frame(delta = get_delta(i), var = i)
+  if (i=="var_fc") {
+    delta_dataframe <- tmp
+  }
+  else {
+    delta_dataframe <- bind_rows(delta_dataframe, tmp)
+  }
+  rm(tmp)
+}
+```
+
+Plot
+```{r, fig.width=6, fig.height=4}
+delta_dataframe$var <- factor(delta_dataframe$var, levels = rev(c("var_rna", "var_dups", "var_fc", "var_mito")))
+
+delta_plot <- ggplot(delta_dataframe, aes(x = delta, y = var)) +
+  geom_segment(aes(x=0, xend=delta, y=var, yend=var)) +
+  geom_point(size = 4, color = "seagreen") +
+  geom_text(aes(label = round(delta, 3)), vjust = -0.75, color = "seagreen") +
+  geom_vline(xintercept = 0.01, linetype = "dashed") +
+  labs(y = "Technical Confounder", 
+       x = "Delta (Observed_variance - Random_variance)", 
+       title = "Comparing Delta of Variance Explained\nbetween Observed and Random", 
+       subtitle = "Mref ~ RNA_concentration + perc_Dups") +
+  scale_x_continuous(breaks = seq(0,1,0.05)) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,0.2))
+
+delta_plot
+```
+
+Add flow_cell
+
+Get variances and get deltas
+```{r}
+ref_arg <- "~RNA_concentration+perc_Dups+flow_cell"
+
+var_fc <- variance_explained_observed(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v)
+var_dups <- variance_explained_observed(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v)
+var_rna <- variance_explained_observed(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v)
+var_mito <- variance_explained_observed(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v)
+
+var_fc_rand <- variance_explained_random(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v, fc_perms)
+var_dups_rand <- variance_explained_random(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v, dups_perms)
+var_rna_rand <- variance_explained_random(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v, rna_perms)
+var_mito_rand <- variance_explained_random(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v, mito_perms)
+
+#use list from before
+for (i in vars) {
+  tmp <- data.frame(delta = get_delta(i), var = i)
+  if (i=="var_fc") {
+    delta_dataframe <- tmp
+  }
+  else {
+    delta_dataframe <- bind_rows(delta_dataframe, tmp)
+  }
+  rm(tmp)
+}
+```
+
+Plot
+```{r, fig.width=6, fig.height=4}
+delta_dataframe$var <- factor(delta_dataframe$var, levels = rev(c("var_rna", "var_dups", "var_fc", "var_mito")))
+
+delta_plot <- ggplot(delta_dataframe, aes(x = delta, y = var)) +
+  geom_segment(aes(x=0, xend=delta, y=var, yend=var)) +
+  geom_point(size = 4, color = "royalblue") +
+  geom_text(aes(label = round(delta, 3)), vjust = -0.75, color = "royalblue") +
+  geom_vline(xintercept = 0.01, linetype = "dashed") +
+  labs(y = "Technical Confounder", 
+       x = "Delta (Observed_variance - Random_variance)", 
+       title = "Comparing Delta of Variance Explained\nbetween Observed and Random", 
+       subtitle = "Mref ~ RNA_concentration + perc_Dups + flow_cell") +
+  scale_x_continuous(breaks = seq(0,1,0.05)) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,0.2))
+
+delta_plot
+```
+
+Add mito. 
+
+Get variances and get deltas
+```{r}
+ref_arg <- "~RNA_concentration+perc_Dups+flow_cell+M_Aligned"
+
+var_fc <- variance_explained_observed(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v)
+var_dups <- variance_explained_observed(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v)
+var_rna <- variance_explained_observed(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v)
+var_mito <- variance_explained_observed(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v)
+
+var_fc_rand <- variance_explained_random(paste0(ref_arg, "+flow_cell"), ref_arg, sample_info, v, fc_perms)
+var_dups_rand <- variance_explained_random(paste0(ref_arg, "+perc_Dups"), ref_arg, sample_info, v, dups_perms)
+var_rna_rand <- variance_explained_random(paste0(ref_arg, "+RNA_concentration"), ref_arg, sample_info, v, rna_perms)
+var_mito_rand <- variance_explained_random(paste0(ref_arg, "+M_Aligned"), ref_arg, sample_info, v, mito_perms)
+
+#use list from before
+for (i in vars) {
+  tmp <- data.frame(delta = get_delta(i), var = i)
+  if (i=="var_fc") {
+    delta_dataframe <- tmp
+  }
+  else {
+    delta_dataframe <- bind_rows(delta_dataframe, tmp)
+  }
+  rm(tmp)
+}
+```
+
+Plot
+```{r, fig.width=6, fig.height=4}
+delta_dataframe$var <- factor(delta_dataframe$var, levels = rev(c("var_rna", "var_dups", "var_fc", "var_mito")))
+
+delta_plot <- ggplot(delta_dataframe, aes(x = delta, y = var)) +
+  geom_segment(aes(x=0, xend=delta, y=var, yend=var)) +
+  geom_point(size = 4, color = "red") +
+  geom_text(aes(label = round(delta, 3)), vjust = -0.75, color = "red") +
+  geom_vline(xintercept = 0.01, linetype = "dashed") +
+  labs(y = "Technical Confounder", 
+       x = "Delta (Observed_variance - Random_variance)", 
+       title = "Comparing Delta of Variance Explained\nbetween Observed and Random", 
+       subtitle = "Mref ~ RNA_concentration + perc_Dups + flow_cell + M_Aligned") +
+  scale_x_continuous(breaks = seq(0,1,0.05)) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,0.2))
+
+delta_plot
+```
+
+So the final technical covariate part of the model is: 
+  expr ~ RNA_concentration + perc_Dups + flow_cell + M_Aligned
+  
+  
+## Developing the modeling schemes
+
+There are several ways to model infection DEGs, popDEs, and popDRs and they will change the result. We need to think carefully about how we want to model each of these to be capture the effects. 
+
+To do this, consider what needs to be modeled, construct the design matrix, consider the terms and finally correct expression so that effect can be captured. 
+
+To help with this, I sketched out some text in an effort to derive this. It is a nice companion for this. 
+
+### Infection DEGs
+
+Let's first think about this for one timepoint. We would have the intercept if NI and the intercept + Bmtb if infection. Therefore we need the intercept and the Mtb beta. We can get that with this model:
+
+~ Infection
+```{r}
+model.matrix(~ Infection, sample_info) %>% colnames()
+```
+Now we can nest across timepoints, such that for each timepoint we calculate Bmtb for that timepoint. In this case we have to include intrinsic timepoint effect estimates to normalize baseline across timepoints. To do this we use the folloowing model:
+
+~ Infection:Timepoint + Timepoint
+```{r}
+model.matrix(~ Infection:Timepoint + Timepoint, sample_info) %>% colnames()
+```
+
+There is no TimepointT1 because the Timepoint effect is relative to the intercept term since it is main factor effect. In other words, intercept catpures the timepoint effect when timepoint is T1. 
+
+We also know that donors will have different baseline levels and we want to control for that. We need to therefore include donor_id in the model to capture intrinsic donor effects. 
+
+~ Infection:Timepoint + Timepoint + Donor_ID
+```{r}
+model.matrix(~ Infection:Timepoint + Timepoint + Donor_ID, sample_info) %>% colnames()
+```
+
+Like TimepointT1, there is no Donor_IDAF183 because the Donor_ID effect is relative to the intercept term since it is main factor effect.  
+
+Now lets add the technical confounders:
+
+~ Infection:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned
+```{r}
+model.matrix(~ Infection:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned, sample_info) %>% colnames()
+```
+
+Like the other main factor effects, there is no flow_cell1 for the same reason. 
+
+Altogether, this model can be interpreted this way:
+1) TimepointT2 is the effect of TimepointT2 on gene expression relative to T1 (T2-T1) - "intrinsic timepoint effects"
+2) Donor_IDAF193 is the effect of Donor AF193 relative to AF183 - "intrinsic donor effects"
+3) flow_cell2 is the effect of flow cell 2 relative to 1 - "intrinsic flow cell effects"
+4) RNA_concentration is the effect of RNA concentration on gene expression
+5) perc_Dups is the effect of percent duplicates on gene expression
+6) M_Aligned is the effect of percent mito DNA on gene expression
+7) InfectionMtb:TimepointT1 is the effect of Mtb infection on gene expression at Timepoint 1
+
+Number 7 and alike terms are the values we will extract and identify genes with a significant effect as infection DEGs. 
+
+### PopDEs
+
+For popDEs, lets also consider a model for just one timepoint. We want the effect of African admixture (ancestry) on gene expression for each condition. We cannot control for donor to donor variation because this would conflict with the Ancestry effect directly. To do this we need a nested model:
+
+~ Infection:African_admixture
+```{r}
+model.matrix(~ Infection:African_admixture, sample_info) %>% colnames()
+```
+
+We need to consider the intrinsic infection effect since we only care about ancestry effects. To do this add infection to the model:
+
+~ Infection:African_admixture + Infection
+```{r}
+model.matrix(~ Infection:African_admixture + Infection, sample_info) %>% colnames()
+```
+
+Now expand to all timepoints. This will nest across timepoints. So it will be a nested model within a nested model. Like the infection effect model, we will also need to control for intrinsic timepoint effects. Do this with the following model:
+
+~ Infection:African_admixture:Timepoint + Infection:Timepoint + Timepoint
+```{r}
+model.matrix(~ Infection:African_admixture:Timepoint + Infection:Timepoint + Timepoint, sample_info) %>% colnames()
+```
+
+Now lets add the technical confounders:
+
+~ Infection:African_admixture:Timepoint + Infection:Timepoint + Timepoint + RNA_concentration + perc_Dups + flow_cell + M_Aligned 
+```{r}
+model.matrix(~ Infection:African_admixture:Timepoint + Infection:Timepoint + Timepoint + RNA_concentration + perc_Dups + flow_cell + M_Aligned , sample_info) %>% colnames()
+```
+
+For all main main factor effects, there is no beta for the reference variable (e.g. Timepoint T1) because the intercept captures that effect. 
+
+Altogether, this model can be interpreted this way:
+1) TimepointT2 is the effect of TimepointT2 on gene expression relative to T1 (T2-T1) - "intrinsic timepoint effects"
+2) flow_cell2 is the effect of flow cell 2 relative to 1 - "intrinsic flow cell effects"
+3) RNA_concentration is the effect of RNA concentration on gene expression
+4) perc_Dups is the effect of percent duplicates on gene expression
+5) M_Aligned is the effect of percent mito DNA on gene expression
+6) InfectionMtb:TimepointT1 is the infection effect of Mtb on gene expression at Timepoint 1 - "intrinsic infection effects for each timepoint"
+7) InfectionNI:African_admixture:TimepointT1 is the effect of African admixture on gene expression for each condition and each timepoint. 
+
+Number 7 and alike terms are the values we will extract and identify genes with a significant effect to identify PopDEs. 
+
+### PopDRs
+
+Let's at first consider a model for one timepoint. For popDRs, we want to capture the interaction between Infection and Ancestry. We need to consider the baseline expression across donors so here, although somewhat contradictory to inital thinking, we include Donor_Id in the model. It can best be thought of as modifying the infection DEG model rather than the popDE model. So for a single timepoint we have this model:
+
+~ Infection:African_admixture + Donor_ID
+```{r}
+model.matrix(~ Infection:African_admixture + Donor_ID, sample_info) %>% colnames()
+```
+
+You can see how something is missing as Infection was split, this is because we do not have the main effects of infection and ancestry modeled. We need to control for their intrinsic effects in order to look at interacction effects. 
+~ Infection:African_admixture + Infection + African_admixture + Donor_ID
+```{r}
+model.matrix(~ Infection:African_admixture + Infection + African_admixture + Donor_ID, sample_info) %>% colnames()
+```
+
+Now we have the interaction effect as InfectionMtb:African_admixture. Let's expand this to all timepoints. We do not nest donor_id because we want the global effect of donor. Do this by nesting everyting but donor_id and then including Timepoint to control for timepoint to timepoint variation like done in the infection DEG model. 
+
+~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID
+```{r}
+model.matrix(~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID, sample_info) %>% colnames()
+```
+  
+Now lets add the technical confounders:
+
+~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned
+```{r}
+model.matrix(~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned, sample_info) %>% colnames()
+```
+
+For all main main factor effects, there is no beta for the reference variable (e.g. Timepoint T1) because the intercept captures that effect. 
+
+Altogether, this model can be interpreted this way:
+1) TimepointT2 is the effect of TimepointT2 on gene expression relative to T1 (T2-T1) - "intrinsic timepoint effects"
+2) Donor_IDAF193 is the effect of Donor AF193 relative to AF183 - "intrinsic donor effects"
+3) flow_cell2 is the effect of flow cell 2 relative to 1 - "intrinsic flow cell effects"
+4) RNA_concentration is the effect of RNA concentration on gene expression
+5) perc_Dups is the effect of percent duplicates on gene expression
+6) M_Aligned is the effect of percent mito DNA on gene expression
+7) InfectionMtb:TimepointT1 is the infection effect of Mtb on gene expression at Timepoint 1 - "intrinsic infection effects for each timepoint"
+8) African_admixture:TimepointT1 is the Admixture effect on gene expression at Timepoint 1 - "intrinsic ancestry effects for each timepoint"
+9) InfectionMtb:African_admixture:TimepointT1 is the interaction effect of African admixture and infection on gene expression for Timepoint T1. 
+
+Number 9 and alike terms are the values we will extract and identify genes with a significant effect to identify PopDRs. 
+
+### Summary
+
+These models are really great and I feel very confident in them. They are the same as what Haley and Joaquin came up with and I was able to derive them without referencing their models. 
+
+Infection DEGs: expr ~ Infection:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned
+PopDEs: expr ~ Infection:African_admixture:Timepoint + Infection:Timepoint + Timepoint + RNA_concentration + perc_Dups + flow_cell + M_Aligned
+PopDRs: expr ~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned 
+
+Now use these models to correct expression so that the values being modeled are captured. This is residuals + the sum of the relevant betas. 
+
+## Observe PCA of corrected expression
+
+#### Correct expression by regressing out the covariates
+
+Before using corrected values as desribed above, see what happens when you batch correct it (i.e regress out the RNA_concentration + perc_Dups + flow_cell + M_Aligned prior to modeling). 
+This is an approach some use to remove technical confounders but I think is poor for our purposed since the flow_Cell variable is horrendously balanced across timepoints. This is different compared to when we include these in the model. 
+
+```{r}
+design_confounders <- model.matrix(~ RNA_concentration + perc_Dups + flow_cell + M_Aligned, data = sample_info)
+vfit_confounders <- lmFit(v, design_confounders) %>% eBayes()
+```
+
+```{r}
+corrected_expression <- residuals(vfit_confounders, v)
+```
+
+```{r}
+pc_corrected <- as.matrix(corrected_expression) %>% t() %>% prcomp()
+```
+
+```{r, fig.height=2, fig.width=4}
+tmp <- pc_corrected$sdev^2
+tmp <- tibble(PC = factor(1:length(tmp)), variance = tmp) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+ggplot(tmp, aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + 
+  theme_bw() +
+  coord_cartesian(xlim = c(0,20))
+rm(tmp)
+```
+
+Prepare PCs for plotting
+```{r}
+prep_df_for_PCA <- function(pc, si) {
+  #Prepare df for plotting, just select the first 20 PCs
+  pc_scores <- as.data.frame(pc$x)[, 1:20] %>% rownames_to_column(var = "filename")
+
+  #add metadata
+  pc_scores <- rownames_to_column(si, var = "filename") %>% left_join(x = pc_scores, by = "filename")
+
+  #relevel infection:
+  pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+  return(pc_scores)
+}
+```
+
+```{r}
+pc_corrected_scores <- prep_df_for_PCA(pc_corrected, sample_info)
+```
+
+```{r, fig.height=6, fig.width=7}
+pc_scores <- pc_corrected_scores 
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket", trans = "log10") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Donor_ID, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_d(option = "turbo") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_ancestry
+p_flow
+p_donor
+
+rm(pc_scores)
+```
+
+Yeah the timepoint effect is somewhat here but it isn't strong and it should be very strong. 
+
+#### Correct expression by adding relevant coefficients to the residuals
+
+We want to see what the data looks like that we are actually modeling in the infection and ancestry models. Therefore, fit each model, extract the residuals and add back the coefficients from the relevant terms. 
+
+Models:
+Infection DEGs: expr ~ Infection:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned
+PopDEs: expr ~ Infection:African_admixture:Timepoint + Infection:Timepoint + Timepoint + RNA_concentration + perc_Dups + flow_cell + M_Aligned
+PopDRs: expr ~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned 
+
+Set designs for each model. 
+```{r}
+design_infection <- model.matrix(~ ~ Infection:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned, data = sample_info)
+design_popDE <- model.matrix(~ Infection:African_admixture:Timepoint + Infection:Timepoint + Timepoint + RNA_concentration + perc_Dups + flow_cell + M_Aligned, data = sample_info)
+design_popDR <- model.matrix(~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID + RNA_concentration + perc_Dups + flow_cell + M_Aligned, data = sample_info)
+
+# remove unestimable columns
+column <- which(colnames(design_popDR) == "African_admixture:TimepointT48")
+design_popDR <- design_popDR[, -column]
+```
+
+Fit to models
+```{r}
+vfit_infection <- lmFit(v, design_infection)
+vfit_popDE <- lmFit(v, design_popDE)
+vfit_popDR <- lmFit(v, design_popDR)
+```
+
+Get corrected expression by adding the relevant coefficients to the residuals. 
+
+First get list of terms to add back for each:
+```{r}
+#set timepoints
+timepoints <- c("T1","T2","T3","T4","T5","T6","T7","T8","T9","T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")
+
+#get list of terms for infection
+infection_beta_list <- list()
+for (t in timepoints) {
+  beta <- paste0("InfectionMtb:Timepoint", t)
+  infection_beta_list <- append(infection_beta_list, beta)
+  rm(beta)
+}
+
+#get list of terms for popDEs
+popDEs_beta_list <- list()
+for (t in timepoints) {
+  beta_mtb <- paste0("InfectionMtb:African_admixture:Timepoint", t)
+  beta_ni <- paste0("InfectionNI:African_admixture:Timepoint", t)
+  popDEs_beta_list <- append(popDEs_beta_list, beta_mtb) %>% append(beta_ni)
+  rm(beta_mtb, beta_ni)
+}
+
+#get list of terms for popDRs
+popDRs_beta_list <- list()
+for (t in timepoints) {
+  beta <- paste0("InfectionMtb:African_admixture:Timepoint", t)
+  popDRs_beta_list <- append(popDRs_beta_list, beta)
+  rm(beta)
+}
+```
+
+Use beta lists to add back to the residuals for each model
+```{r}
+corrected_infection <- residuals(vfit_infection, v)
+for (beta in infection_beta_list) {
+  corrected_infection <- corrected_infection + vfit_infection$coefficients[,beta]%*%t(design_infection[,beta])
+}
+
+corrected_popDEs <- residuals(vfit_popDE, v)
+for (beta in popDEs_beta_list) {
+  corrected_popDEs <- corrected_popDEs + vfit_popDE$coefficients[,beta]%*%t(design_popDE[,beta])
+}
+
+corrected_popDRs <- residuals(vfit_popDR, v)
+for (beta in popDRs_beta_list) {
+  corrected_popDRs <- corrected_popDRs + vfit_popDR$coefficients[,beta]%*%t(design_popDR[,beta])
+}
+```
+
+Calculate PCs from corrected expression.
+```{r}
+pc_infection <- as.matrix(corrected_infection) %>% t() %>% prcomp()
+pc_popDEs <- as.matrix(corrected_popDEs) %>% t() %>% prcomp()
+pc_popDRs <- as.matrix(corrected_popDRs) %>% t() %>% prcomp()
+```
+
+Plot variance explained by top 20 PCAs for each
+```{r, fig.height=2, fig.width=4}
+#infection
+tmp <- pc_infection$sdev^2
+tmp <- tibble(PC = factor(1:length(tmp)), variance = tmp) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+ggplot(tmp, aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained", title = "infection model") + 
+  theme_bw() +
+  coord_cartesian(xlim = c(0,20))
+rm(tmp)
+
+#popDE
+tmp <- pc_popDEs$sdev^2
+tmp <- tibble(PC = factor(1:length(tmp)), variance = tmp) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+ggplot(tmp, aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained", title = "popDE model") + 
+  theme_bw() +
+  coord_cartesian(xlim = c(0,20))
+rm(tmp)
+
+#popDR
+tmp <- pc_popDRs$sdev^2
+tmp <- tibble(PC = factor(1:length(tmp)), variance = tmp) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+ggplot(tmp, aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained", title = "popDR model") + 
+  theme_bw() +
+  coord_cartesian(xlim = c(0,20))
+rm(tmp)
+```
+
+Prepare PCs for plotting
+```{r}
+pc_infection_scores <- prep_df_for_PCA(pc_infection, sample_info)
+pc_popDE_scores <- prep_df_for_PCA(pc_popDEs, sample_info)
+pc_popDR_scores <- prep_df_for_PCA(pc_popDRs, sample_info)
+```
+
+Plot PC1/PC2 for corrected expression infection:
+```{r, fig.height=6, fig.width=7}
+pc_scores <- pc_infection_scores 
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket", trans = "log10") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Donor_ID, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_d(option = "turbo") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_ancestry
+p_flow
+p_donor
+
+rm(pc_scores)
+
+pdf(file = "results/batch1_only/PCA_infection_effects.pdf", height = 6, width = 7, family = "ArialMT")
+p_time
+dev.off()
+```
+
+Nice! There is a time effect that is captured here. 
+
+PopDEs
+```{r, fig.height=6, fig.width=7}
+pc_scores <- pc_popDE_scores
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket", trans = "log10") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Donor_ID, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_d(option = "turbo") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_ancestry
+p_flow
+p_donor
+
+rm(pc_scores)
+```
+
+PopDRs
+```{r, fig.height=6, fig.width=7}
+pc_scores <- pc_popDR_scores 
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket", trans = "log10") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Donor_ID, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_d(option = "turbo") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_ancestry
+p_flow
+p_donor
+
+rm(pc_scores)
+```
+
+## Conclusion
+
+These PCAs do not show much ancestry effect, but they do show a very strong infection effect. In the future notebooks I will model infection DEGs, popDEs, and popDRs using the models described in this notebook. 

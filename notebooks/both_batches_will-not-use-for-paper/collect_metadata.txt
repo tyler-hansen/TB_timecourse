@@ -1,0 +1,9 @@
+11.17.23 - Tyler Hansen
+
+I want to collect metadata on the files to summarize and understand the data structure. I will do this by converting filenames into a tsv table that can be read into R. Run1-3 use "_" fs, run4 uses "-".
+
+This is a little tough because the data is a little different for each condition/run. I want the following structure:
+
+Number	Donor_ID  Timepoint  Infection(TB/NI) MOI Location Run 
+
+To make this I made an ran the script: metadata_from_filenames.sh

@@ -1,0 +1,278 @@
+---
+title: "Assembly of Covariates for Differential Analysis with Limma-Voom"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 12.1.2023 | Update 2.6.2024
+
+I need to add covariates to my metadata. Specifically, I would like the following: percent_dup, percent_GC, percent_aligned, flow cell, and ancestry-related information. In this notebook, I will use various sources to get this metadata and I will append it to the exiting sample info file. In general, percent_GC and percent_dup comes from values reported by fastQC after trimming. Percent_aligned comes from kallisto standard output. These were pooled together for all samples in a run by the tool multiQC. The flow cell will be unique to each flow cell across samples (i.e run1 cells 1-3 and run2 cells 1-3 will be treated as diffferent flow cells). The flow cell can be gleaned from the fastq header. Ancestry info will come from Haley's metadata file and the 2016 cell paper, but there are 9 samples of the 26 that do not have ancestry infor in one of these documents. I may have to run admixture myself, but I need to identify where their VCF files are. 
+
+I will make this for the filtered samples and for all samples. 
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+#load metadata
+sample_info_filt <- read_tsv("results/metadata_filtered-samples.tsv", col_names = T) 
+sample_info_all <- read_tsv("results/metadata.tsv", col_names = colnames(sample_info_filt)) 
+```
+## Run 1
+
+Run 1 has the percent_X information stored in a metadata file that Haley made. Load, tidy, and join by filename.
+
+```{r}
+# run1
+# load Haley metadata
+md_haley <- read_csv("data/covariates/run1/meta_data_GOOD_SAMPLES_with_ccScores.txt")
+
+#drop all but indiv_ID perc_Dups perc_GC perc_Aligned
+md_haley <- select(md_haley, indiv_ID, flow_cell, perc_Dups, perc_GC, perc_Aligned)
+
+#make a new column with filename in order to join to sample info above:
+md_haley <- mutate(md_haley, filename = paste0("kallisto_", indiv_ID, "_run1"))
+
+#join with sample info and tidy by removing a few columns and moving filename to the first column.
+new_si_filt <- left_join(sample_info_filt, md_haley, by = "filename") %>% select(-indiv_ID, -sample_ID, -kallisto_number) %>% relocate(filename, .before = Donor_ID)
+new_si_all <- left_join(sample_info_all, md_haley, by = "filename") %>% select(-indiv_ID, -sample_ID, -kallisto_number) %>% relocate(filename, .before = Donor_ID)
+```
+
+## Run 2-4: Aligned
+
+Run 2-4 has this in a multiQC file. Make a function to Load, tidy, and join by filename.
+
+```{r}
+# run 2-4: perc_Aligned
+#load multiQC file
+add_percAligned <- function(mqc_file_path, new_si, run_number) {
+  x <- read_tsv(mqc_file_path, show_col_types = FALSE)
+  x <- mutate(x, filename = paste0("kallisto_", str_split(x$Sample, "_S", simplify = TRUE)[, 1], "_", run_number))
+  x <- select(x, filename, "perc_Aligned"=percent_aligned)
+  x$perc_Aligned <- round(as.numeric(x$perc_Aligned)/100, digits = 2)
+  x <- left_join(new_si, x, by = "filename") %>% unite(perc_Aligned, perc_Aligned.x, perc_Aligned.y, sep = "", na.rm = T)
+  return(x)
+}
+
+new_si_filt <- add_percAligned("data/covariates/run2/multiqc_kallisto.txt", new_si_filt, "run2")
+new_si_filt <- add_percAligned("data/covariates/run3/multiqc_kallisto.txt", new_si_filt, "run3")
+new_si_filt <- add_percAligned("data/covariates/run4/multiqc_kallisto.txt", new_si_filt, "run4")
+
+new_si_all <- add_percAligned("data/covariates/run2/multiqc_kallisto.txt", new_si_all, "run2")
+new_si_all <- add_percAligned("data/covariates/run3/multiqc_kallisto.txt", new_si_all, "run3")
+new_si_all <- add_percAligned("data/covariates/run4/multiqc_kallisto.txt", new_si_all, "run4")
+```
+## Run 2-4: GC & dups
+
+Run 2-4 has this in a multiQC file. Make a function to Load, tidy, and join by filename. Since runs 3 and 4 have multiple fastqs, I took the mean values of the files. 
+```{r}
+# run 2-4: perc_Aligned
+#load multiQC file
+add_percGCdup_run2 <- function(mqc_file_path, new_si, run_number) {
+  x <- read_tsv(mqc_file_path, show_col_types = FALSE)
+  x <- mutate(x, filename = paste0("kallisto_", str_split(x$Sample, "_S", simplify = TRUE)[, 1], "_", run_number))
+  x <- select(x, filename, "perc_Dups"=`FastQC_mqc-generalstats-fastqc-percent_duplicates`, 
+              "perc_GC"=`FastQC_mqc-generalstats-fastqc-percent_gc`)
+  x$perc_Dups <- round(as.numeric(x$perc_Dups)/100, digits = 2)
+  x$perc_GC <- round(as.numeric(x$perc_GC)/100, digits = 2)
+  x <- left_join(new_si, x, by = "filename") %>%
+    unite(perc_Dups, perc_Dups.x, perc_Dups.y, sep = "", na.rm = T) %>% 
+    unite(perc_GC, perc_GC.x, perc_GC.y, sep = "", na.rm = T)
+  return(x)
+}
+
+add_percGCdup_runs34 <- function(mqc_file_path, new_si, run_number) {
+  x <- read_tsv(mqc_file_path, show_col_types = FALSE)
+  x <- mutate(x, filename = paste0("kallisto_", str_split(x$Sample, "_S", simplify = TRUE)[, 1], "_", run_number))
+  x <- select(x, filename, "perc_Dups"=`FastQC_mqc-generalstats-fastqc-percent_duplicates`, 
+              "perc_GC"=`FastQC_mqc-generalstats-fastqc-percent_gc`)
+  x$perc_Dups <- round(as.numeric(x$perc_Dups)/100, digits = 2)
+  x$perc_GC <- round(as.numeric(x$perc_GC)/100, digits = 2)
+  x <- group_by(x, filename) %>%
+    summarise(perc_Dups = mean(perc_Dups), perc_GC = mean(perc_GC))
+  x <- left_join(new_si, x, by = "filename") %>%
+    unite(perc_Dups, perc_Dups.x, perc_Dups.y, sep = "", na.rm = T) %>% 
+    unite(perc_GC, perc_GC.x, perc_GC.y, sep = "", na.rm = T)
+  return(x)
+}
+
+new_si_filt <- add_percGCdup_run2("data/covariates/run2/multiqc_general_stats.txt", new_si_filt, "run2")
+new_si_filt <- add_percGCdup_runs34("data/covariates/run3/multiqc_general_stats.txt", new_si_filt, "run3")
+new_si_filt <- add_percGCdup_runs34("data/covariates/run4/multiqc_general_stats.txt", new_si_filt, "run4")
+
+new_si_all <- add_percGCdup_run2("data/covariates/run2/multiqc_general_stats.txt", new_si_all, "run2")
+new_si_all <- add_percGCdup_runs34("data/covariates/run3/multiqc_general_stats.txt", new_si_all, "run3")
+new_si_all <- add_percGCdup_runs34("data/covariates/run4/multiqc_general_stats.txt", new_si_all, "run4")
+```
+## Run 2: Flow Cell
+Run 2 has multiple flow cell ids. I recorded this in a text file. Read in and process. (see collect_covariates-flow-cell.txt)
+```{r}
+#got this from chatGPT and it works
+
+flo_ids_run2 <- read_lines("results/run2_flow-cell.txt")
+
+flo_ids_run2 <- tibble(
+  key = flo_ids_run2[c(TRUE, FALSE)],
+  value = flo_ids_run2[c(FALSE, TRUE)])
+
+#Extract flow cell
+flo_ids_run2 <- mutate(flo_ids_run2, flowcell_id = str_split(value, ":", simplify = TRUE)[, 3])
+
+#There are two flow cells, convert to 4-->HNYMNDMXX and 5-->HNYYGDMXX. 
+flo_ids_run2 <- mutate(flo_ids_run2,  flow_cell = case_when(flowcell_id == "HNYMNDMXX" ~ 4, 
+                                                            flowcell_id == "HNYYGDMXX" ~ 5,))
+
+#convert key to filename
+flo_ids_run2 <- mutate(flo_ids_run2, filename = paste0("kallisto_", str_split(key, "_S", simplify = TRUE)[, 1], "_run2"))
+
+#drop old cols
+flo_ids_run2 <- select(flo_ids_run2, filename, flow_cell)
+```
+
+```{r}
+new_si_filt <- left_join(new_si_filt, flo_ids_run2, by = "filename") %>%
+    unite(flow_cell, flow_cell.x, flow_cell.y, sep = "", na.rm = T)
+
+new_si_all <- left_join(new_si_all, flo_ids_run2, by = "filename") %>%
+    unite(flow_cell, flow_cell.x, flow_cell.y, sep = "", na.rm = T)
+```
+
+
+## Run 3-4: Flow Cell
+
+Run 3-4 were each on their own flow cell. run3 --> cell 6, run4 --> cell 7. 
+```{r}
+# run 3-4: flow cell
+new_si_filt <- new_si_filt %>%
+  mutate(flow_cell = ifelse((is.na(flow_cell) | Run == "run3"), 6, flow_cell)) %>%
+  mutate(flow_cell = ifelse((is.na(flow_cell) | Run == "run4"), 7, flow_cell))
+
+new_si_all <- new_si_all %>%
+  mutate(flow_cell = ifelse((is.na(flow_cell) | Run == "run3"), 6, flow_cell)) %>%
+  mutate(flow_cell = ifelse((is.na(flow_cell) | Run == "run4"), 7, flow_cell))
+```
+
+## Modify Location
+Ilia spoke with Luis and the "unspecified" location is just Montreal. So I will modify that column here. 
+```{r}
+new_si_filt <- mutate(new_si_filt, Location = ifelse(Location == "unspecified", "MONTREAL", Location)) %>% 
+  mutate(Location = ifelse(Location == "Chicago", "CHICAGO", Location))
+
+new_si_all <- mutate(new_si_all, Location = ifelse(Location == "unspecified", "MONTREAL", Location)) %>% 
+  mutate(Location = ifelse(Location == "Chicago", "CHICAGO", Location))
+```
+
+## Modify Timepoint
+Currently timepoint is a character "T4" not numeric "4". Adujust this.  
+```{r}
+new_si_filt <- mutate(new_si_filt, Timepoint_hr = as.numeric(str_remove(Timepoint, "T"))) %>%
+  relocate(Timepoint_hr, .after = Timepoint)
+
+new_si_all <- mutate(new_si_all, Timepoint_hr = as.numeric(str_remove(Timepoint, "T"))) %>%
+  relocate(Timepoint_hr, .after = Timepoint)
+```
+
+## Modify Infection column 
+```{r}
+new_si_filt <- dplyr::rename(new_si_filt, "Infection" = `Infection(TB/NI)`)
+new_si_all <- dplyr::rename(new_si_all, "Infection" = `Infection(TB/NI)`)
+```
+
+#Fix duplicate columns for _filt
+My duplicate rows contain missing values for columns flow_cell, perc_Dups, perc_Aligned, and perc_GC. Duplicate the values from the original version.w
+```{r}
+#select rows with empty values
+empty_rows <- filter(new_si_filt, perc_Dups == "") %>% dplyr::select(-flow_cell, -perc_Dups, -perc_GC, -perc_Aligned)
+
+#make new column without the remove "_duplicated" suffix.
+empty_rows <- mutate(empty_rows, original_filename = str_remove(filename, "_duplicated"))
+
+#remove the last _duplicate
+empty_rows <- mutate(empty_rows, original_filename = ifelse(str_detect(original_filename, "_duplicated"), str_remove(original_filename, "_duplicated"), original_filename))
+
+#selct just the covariates and filename
+covs <- dplyr::select(new_si_filt, filename, flow_cell, perc_Dups, perc_GC, perc_Aligned)
+
+#left_join by original_filename
+empty_rows <- left_join(empty_rows, covs, by = c("original_filename" = "filename")) %>% dplyr::select(-original_filename)
+
+#remove rows with empty values from new_si
+full_rows <- filter(new_si_filt, !perc_Dups == "") 
+
+#row bind empty_rows and full rows.
+new_si_filt <- bind_rows(empty_rows, full_rows)
+```
+
+## Remove bad samples not in haley's metadata for _all
+Basically samples with nothing in the GC column. 
+```{r}
+new_si_all <- filter(new_si_all, perc_GC != "")
+```
+
+### Add Ancestry Information
+```{r}
+# run1
+# load Haley metadata
+md_haley <- read_csv("data/covariates/run1/meta_data_GOOD_SAMPLES_with_ccScores.txt")
+
+#drop all but indiv_ID perc_Dups perc_GC perc_Aligned
+md_haley <- select(md_haley, individual, "self_reported_ethnicity" = ethnicity, African_admixture, European_admixture) %>%
+  mutate(self_reported_ethnicity = if_else(self_reported_ethnicity == "european", "EA", self_reported_ethnicity)) %>%
+  mutate(self_reported_ethnicity = if_else(self_reported_ethnicity == "african", "AA", self_reported_ethnicity)) %>% distinct()
+
+#load 2016 cell paper metadata
+cell <- read_tsv('data/covariates/2016_cell_donor_info.txt') %>%
+  select("individual" = Label, "self_reported_ethnicity" = Self_reported_ethnic, African_admixture, European_admixture) %>% distinct()
+
+#rowbind:
+ancestry <- bind_rows(md_haley, cell) %>% distinct()
+
+#join with sample info
+new_si_filt <- left_join(new_si_filt, ancestry, by = c("Donor_ID" = "individual"))
+new_si_all <- left_join(new_si_all, ancestry, by = c("Donor_ID" = "individual"))
+```
+I cannot find ancestry info (i.e. self_reported_ethnicity, African_admixture, and European_Admixture) for 9 of the 26 of the donors in our study. They were not part of the cell study, so they are not in the supplementary table there. I've scanned Haley's directory and looked through most of midway3 for the genotypes for these donors, I can't find them. I can find all of the genotypes for the donors used in the cell paper, just not these ones.
+
+They are:
+AF278
+AF781
+EU233
+EU408
+EU145
+AF106
+AF555
+AF661
+AF854
+
+It turns out these samples are not from the MLS set, they are from a UPenn study: https://www.sciencedirect.com/science/article/pii/S1934590917300887 
+
+I cannot find genotypes on the cluster and I do not have ancestry info for these. However, I do have sex, age and self-reported ethnicity info that I can include. I will do that below. I will have to obtain the genotypes and run admixture myself, however we have to first request access. 
+
+#Add sex, age, and self-reported ethnicity. (and donor origin)
+All MLS donors are male and I do not yet have the age information for them. 
+```{r}
+upenn <- read_tsv("data/covariates/upenn_metadata_select_columns.txt", show_col_types = F)[,1:4] %>% mutate(db = "upenn")
+
+new_si_filt <- left_join(new_si_filt, upenn, by = c("Donor_ID" = "Subject_ID")) %>% 
+  unite(self_reported_ethnicity.x, self_reported_ethnicity.y, remove = T, sep = "", col = "self_reported_ethnicity", na.rm = T) %>%
+  mutate(Sex = if_else(is.na(Sex), "male", Sex)) %>%
+  mutate(db = if_else(is.na(db), "MLS", db))
+
+new_si_all <- left_join(new_si_all, upenn, by = c("Donor_ID" = "Subject_ID")) %>% 
+  unite(self_reported_ethnicity.x, self_reported_ethnicity.y, remove = T, sep = "", col = "self_reported_ethnicity", na.rm = T) %>%
+  mutate(Sex = if_else(is.na(Sex), "male", Sex)) %>%
+  mutate(db = if_else(is.na(db), "MLS", db))
+```
+## Write Out
+```{r}
+write_tsv(x = new_si_filt, file = "results/metadata_filtered-samples_with-covariates.tsv", col_names = T)
+write_tsv(x = new_si_all, file = "results/metadata_with-covariates.tsv", col_names = T)
+```
+
+
+
+
+
+

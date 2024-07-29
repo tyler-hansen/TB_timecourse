@@ -1,0 +1,11 @@
+data/
+results/
+TB_timecourse.Rproj
+.Rproj.user/
+.R*
+*.pdf
+*.png
+*.err
+*.out
+*.RData
+*.html

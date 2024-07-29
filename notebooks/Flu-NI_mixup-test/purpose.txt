@@ -1,0 +1,3 @@
+Tyler Hansen - 05.14.2024
+
+We have pretty bad batch effects where batch 2 is all responding for the NI condition. This is very strange and possibly there was contamination with mycobacterrium. It is also possible that the NI and the flu samples were mixed up. I want to test that with these series of analyses. 

@@ -1,0 +1,100 @@
+Tyler Hansen
+
+1.4.2024
+
+After doing some research, I am concerened that using kallisto-generate estimated counts for limma is poor. In parallel, I want to redo mapping and counting with STAR and featureCounts, respectively. 
+
+I will do this on the cluster, since these files are large. Once I have the counts matrix, I will bring down to local. 
+
+Today I did the following:
+-Downloaded hg38.fa and hg38.chrom.sizes from UCSC (https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/). I validated transfer by checking md5checkSums.
+-Downloaded gencode.v44.gtf gene annotations from gencode (https://www.gencodegenes.org/human). Specifically the basic gene annotation - PRI regions only. After reading into it this is the best file to use for our purposes. 
+-Submitted a job for making a STAR index. See the script "build_star_index_hg38_gencode.v44_100.sbatch" within tyler/general_purpose/STAR_builds. 
+
+1.5.2024
+
+The job failed because I didn't capitalize STAR. I fixed and resubmitted. It is running now. 
+
+In the meantime, I need to create a list or table of all of the files that should be combined when doing the alignment. For example run3 samples have 3 files each (one for each flow cell). 
+	-In terms of merging across runs, there is only one that is worthwhile--AF53_T8_Mtb_MOI_5--but I am concerend this will be confusing to control for when modeling as it will be both run2 and 3. For this reason, I will not merge them now. 
+	-For run 3, there are 4 files for each sample. In this case it will be simple to specify. For example: 2_AF53_T8_Mtb_MOI_5_S11_L00{1..4}_R1_001_trimmed.fq.gz
+	-For run 4, it has paired data, but we do not want that. We will therefore take only the Val2 file, which is the longer read, and treat it like it is single end data.
+	-Do not process bad samples from run 1 and 2. These are the following:
+		
+		Run1
+			AF55_T0_NI_FLOW-CELL-3 #this was already removed by haley
+			AF55_T0_Mtb_MOI_5_FLOW-CELL-3 #this was already removed by haley
+			9_AF193_T15_Mtb_MOI_5 #this was already removed by haley
+		Run2
+			EU262_T1_Flu_MOI_0.1
+			EU233_T3_Flu_MOI_0.1
+			EU262_T5_Flu_MOI_0.1
+			AF661_T1_NI
+			EU126_T24_Mtb_MOI_5
+			AF31_T5_Mtb_MOI_5
+			AF854_T3_Mtb_MOI_5
+			AF854_T24_Mtb_MOI_5
+			AF53_T8_Mtb_MOI_5
+			AF31_T3_NI
+			AF69_T5_NI
+			AF781_T8_NI
+			AF661_T5_NI
+			AF31_T5_NI
+	-I will make a script for each run, since each comes with it's own challenges. 
+
+I also need to figure out what kind of resources I need to process this many files. I will do that now. For each, I will just do the max time, which is 7 days. I will request 12 cores and 60GB RAM. That will give a rate of ~549 million reads per hour, which is ~36 samples per hour (15 million reads per sample). This should take roughly 11 hours for run 1 (385 samples). This should be ~121 SUs for run1.
+
+I wrote a test script and ran to see if the mapping works for one file. While waiting for that, I wrote a script to do all the files in the run1 directory. I also wrote a run2 script that uses a skipfile to skip over the bad samples. This skip file is in my code directory.  
+
+
+1.17.2024
+While on vacation, I wrote and executed scripts for runs3 and 4. 
+
+The realignment for all four runs appeared to work. Next step is to make a counts matrix using feature counts and the genecode.v44.gtf for basic gene annotation - PRI regions only.
+
+Before doing this, I need to determine if my files are stranded and, if so, which orientation. To do this I wtote a script (infer_experiments.sbatch) that infers this information from bam files. For this, I had to convert the gencode GTF to bed format which I did with the following code: 
+	awk '{ if ($0 ~ "transcript_id") print $0; else print $0" transcript_id \"\";"; }' gencode.v44.primary_assembly.basic.annotation.gtf | gtf2bed - > gencode.v44.primary_assembly.basic.annotation.bed
+-The use of awk here was to add transcript_id to lines that didn't have it. It hacked the bedops gtf2bd function and I do not believe it will matter for the purposes of determining standedness. I would not use the .bed fill though for anything else. 
+
+I ran the sbatch job overnight.
+
+1.18.2024
+
+Runs 1,2,3 are reversely stranded (-s 2) as more than 75% of reads for all samples within them are 'Fraction of reads explained by "+-,-+"' from RSeQC. 
+
+Run4 is the opposite, it is stranded (-s 1) as more than 75% or all reads are 'Fraction of reads explained by "++,--":' from RSeQC.
+
+
+So I wrote a script for featureCounts and it ran well (featureCounts_run1_test.sbatch), but it reports >60,000 meta-features (genes) and I am concerned this will be an issue. I therefore considered only running on genes with gene_type="protein_coding" so I filtered the GTF file with the following code: 
+
+grep 'gene_type "protein_coding"' /project/lbarreiro/USERS/tyler/general_purpose/hg38/gencode.v44.primary_assembly.basic.annotation.gtf > /project/lbarreiro/USERS/tyler/general_purpose/hg38/gencode.v44.primary_assembly.basic.annotation.protein_coding-only.gtf
+
+I then re-ran the code to compare.
+
+So the number of meta-features is reduced to 20K, so that is good. I also noticed that even though 2/3rds of the metafeatures were lost, only 5-10% of reads were lost. Meaning most reads don't map to those. For this analysis, I can see pros/cons of either, so I am deciding to proceded with both sets. 
+
+This goes really fast, so I put all counting into one script called "featureCounts.sbatch" and ran overnight.
+
+1.19.2024
+
+I checked the output and it looks great. A few samples have low counting rate, where most reads did not get counted to a feature. For these, I rechecked and the strandedness is correct. It looks like they just have high duplicaiton rates, which is already going to be in a covariate in our analysis. Still, I think we should include them but also include mapping rate and counting rate as covariates.
+
+This is the end of the notebook so far. I think the main thing to do next is build a metadata table for the new strategy. I think only the covariate perc_Align needs to be remade. And then we need to add perc_Counted. This can be done by using the STAR output for perc_Align and the featureCounts summary to calculate perc_Counted. I should also look at gene body coverage with RSeQC geneBody_coverage.py.
+
+1.22.2024
+
+Not the end yet! I did the following this morning: 
+1. Downloaded a gene model from UCSC in bed format (gencode.v44.knownGene.UCSC.bed). Each line is a gene. This was actually challenging to transfer, I had to learn and use SFTP from the command line. 
+2. Wrote a script (geneBody_coverage.sbatch) to calculate geneBody_coverage for each sample.
+
+The script failed because the reads are not sorted and indexed. I therefore sorted and indexed them with a script I wrote (samtools_sort_and_index.sbatch).
+
+1.23.2024
+
+My script ran out of time, because I only gave it 4 hours. I found that it ran everything up to the second file in run4, so runs1-3 are solid. I deleted the partially sorted file and re-ranthe script only on the run4 directory (samtools_sort_and_index_run4-fix.sbatch)  
+
+1.24.2024
+
+Last night, I ran the geneBody_coverage.sbatch script, but I realized today it takes a very long time to process and will not finish in the time alloted by the partition. So I have a few options, but I think the best approach would be to submit a job array with each job corresponding to a file.
+
+In talking with Luis yesterday, he said that it probably was not worth pursuing this direction or realignment. So I am going to focus on the kallisto samples, for now. Nonetheless, it is nice to have these files in case we want to use them. They do occupy a lot of space on the cluster, so I should consider deleting the BAMs once they are clearly no longer needed.    

@@ -1,0 +1,3 @@
+11.15.23 - Tyler Hansen
+
+I renamed all of the run1 kallisto folder names so they contain metadata. Haley kindly already had the key-value file for this. To do this I wrote a script: code/rename_kallisto_sample_run1_folders.sh. I save the output in the same directory so that I can guarantee that I didn't mix up the names when I think about it later. I used the key-value pair: data/sample_conversion_all_samples_combined.txt

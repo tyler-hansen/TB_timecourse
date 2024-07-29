@@ -1,0 +1,1840 @@
+---
+title: "Linear modeling of RNA-seq data with Limma-Voom: Infection vs. Time"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 2.29.2024
+
+This notebook specifically looks at the effect of the infection for all timepoints and this effect at each timepoint. Ancestry relate analysis will come later. 
+
+In EDA_limma, I tried to identify how best to model my data. I also discussed this with both Raul and Luis. After all of this, I've come up with a plan for modeling the data and how to test that it is working. In this notebook, I will analyze this data following these strategies. 
+
+I will first identify genes that are differentially expressed between infection and NI using a loose threshold (lfc - 0, adj.pval < 0.05). I will also do some basic analysis on genes without using a threshold, like gsea. 
+
+Then I will model the infection at each timepoint using a nested model (Timepoint:Infection) and intersect the results with genes identified globably with the loose threshold. 
+
+I will then identify DEGs per timepoint and report. 
+
+I will then extract betas from each timepoint, mean-center them, and then cluster by their behavior using hclust and kmeans. I will then run pathway enrichment overrepresentation analysis on the individual clusters to see which pathways they represent. 
+
+## Setup
+
+### Packages
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+suppressPackageStartupMessages(library(GenomicFeatures))
+library(GenomicRanges)
+library(rtracklayer)
+suppressPackageStartupMessages(library(plyranges))
+library(factoextra)
+```
+
+### Setup Three Tables
+```{r}
+#read in cts
+cts <- read_tsv("data/kallisto.gene-level.lengthScaledTPM.duplicates-included.tsv", show_col_types = F)
+
+#read in gtf
+gtf <- readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+
+#read in sample info/metadata and sort alphabetically by filename
+sample_info <- read_tsv("results/metadata_filtered-samples_with-covariates.tsv", col_names = T, show_col_types = F) %>% column_to_rownames("filename")
+
+#convert flow_cell to factor:
+sample_info$flow_cell <- factor(sample_info$flow_cell)
+
+#reorder timepoint levels:
+sample_info$Timepoint <- factor(sample_info$Timepoint, levels = c("T1","T3","T5","T8","T12","T18","T24","T30","T36"))
+
+#convert flow_cell to factor:
+sample_info$Infection <- factor(sample_info$Infection, levels = c("NI","Mtb"))
+```
+
+### Remove Run2 AF69 samples
+Remove from metadata/sample_info so when intersecting in the filter step, it is removed from the counts as well. 
+```{r}
+sample_info <- dplyr::filter(sample_info, !(Run %in% c("run2") & Donor_ID == "AF69"))
+sample_info <- sample_info[rownames(sample_info) != "kallisto_4_AF69_T4_NI_run1", ]
+```
+
+
+### Swap library count outlier
+```{r}
+#I checked and this worked
+cts$kallisto_14_EU144_T18_Mtb_MOI_5_run1 <- read_tsv("data/kallisto.gene-level.lengthScaledTPM.tsv", show_col_types = F)$kallisto_14_EU144_T16_Mtb_MOI_5_run1
+```
+
+### Filter counts
+The general filtering strategy is the same as in the all samples, but we will compare three strategies of removing low count data.  
+
+Filter counts at three levels: 1) protein coding genes only; 2) samples from filtered metadata table (not all samples will be analyzed); 3) remove low count data with voom-transformed row medians > 1.5. 
+
+1) protein coding filter
+```{r}
+#extract protein coding genes. I checked and this entire pipe works. 
+pc_gene_ids <- plyranges::filter(gtf, type == 'gene', gene_biotype == 'protein_coding') %>% as.data.frame() %>% dplyr::select(gene_id, gene_name)
+
+#join with counts to select protein coding genes.
+cts <- left_join(pc_gene_ids, cts, by = 'gene_id')
+
+#merge ensembl_id and gene name and set as to rownames. 
+cts <- unite(cts, "ID", gene_id:gene_name, sep = "_") %>% column_to_rownames(var = "ID")
+```
+
+2) samples from metadata table
+```{r}
+#filter samples from cts
+cts <- dplyr::select(cts, intersect(colnames(cts), row.names(sample_info))) 
+
+#match cts colname order with sample info order. 
+cts <- select(cts, matches(rownames(sample_info)))
+
+#for some reason, this doesn't work perfectly, so fix with this code: 
+cts <- relocate(cts, kallisto_14_EU144_T4_NI_run1_duplicated_duplicated, .after = kallisto_5_AF95_T12_NI_run1_duplicated)
+
+```
+
+3) remove low count data by voom-transformed row medians > 1.5
+```{r}
+#voom transform first
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+v <- voom(dge, design = model.matrix(~ 0 + Infection + Timepoint + Donor_ID + flow_cell + perc_GC + perc_Aligned + perc_Dups, data = sample_info), plot = F)
+
+#filter genes based on voom-transformed row medians > 1.5. This is equivalent to 10^1.5 = 31.6 raw counts. This is much more stringent.  
+keep <- data.frame(genes = rownames(cts), medians = apply(v$E, 1, median), order = 1:nrow(cts))
+cts <- cts[which(keep$medians > 1.5), ]
+```
+
+Save the filtered counts:
+```{r}
+saveRDS(cts, file = "data/filtered_counts.rds")
+```
+
+## Model infection:
+
+Model: ~ 0 + Infection + Timepoint + Donor_ID + technical confounders[flow_cell + perc_GC + perc_Aligned + perc_Dups]
+
+Beta of Infection is the effect due to infection
+Beta of Timepoint is the effect due to timepoint variability (categorical)
+Beta of Donor_ID is the effect due to donor-to-donor variability
+
+Note: I am unable to model Sex since I am including Donor_ID here.
+
+### Read in sample info and set design
+
+I want to model the infection, to identify genes that respond to infection at all timepoints across all donors. The covariates here are GC, Dups, Aligned, and flow_cell. See EDA_limma.Rmd for PCAs and UMAPs.
+```{r}
+#set design matrix. I cannot do sex since I am modeling Donor_ID
+design <- model.matrix(~ 0 + Infection + Timepoint + Donor_ID + flow_cell + perc_GC + perc_Aligned + perc_Dups, data = sample_info)
+```
+
+### Voom transform
+Now that the counts are filtered, perform the voom tramsformation. 
+```{r}
+#if match, then this will print true
+all(rownames(design) == colnames(cts))
+
+#make dgelist again and voom transform
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+v <- voom(dge, design, plot = T)
+```
+
+### Fit model and compute empirical bayes statistics for contrasts
+```{r}
+#fit model
+vfit <-lmFit(v, design)
+
+#make contrasts and apply to model
+contrast.matrix <- makeContrasts(InfectionMtb-InfectionNI, levels = coef(vfit))
+vfit <- contrasts.fit(vfit, contrasts=contrast.matrix)
+
+#compute stats
+vfit <- eBayes(vfit)
+```
+
+### Plot residual variance vs. expression SA plot
+
+```{r}
+plotSA(vfit)
+```
+
+Sigma is the estimated residual standard deviation, so the variance is no longer dependent on the mean expression level. 
+
+### Verify model is working correctly by extracting top hits and plotting their voom transformed counts.
+```{r}
+#get top hits with topTable
+res <- topTable(vfit, number = 100)
+top <- row.names(res)[1:4]
+
+#subset v by top rownames
+top_v <- v$E[top, ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id")
+
+#pivot longer
+top_v <- pivot_longer(top_v, cols = !gene_id, names_to = "sample", values_to = "voom_cts")
+
+#add metadata by joining with sample_info (move rownames to col first)
+top_v <- left_join(top_v, rownames_to_column(sample_info, var = "sample"), by = "sample")
+
+#convert gene_id to symbol
+top_v <- mutate(top_v, symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+Great! These capture the Infection difference, but only upregulated genes are shown. 
+
+Try getting downregulated genes:
+```{r}
+#get top hits with topTable
+res <- topTable(vfit, number = Inf) %>% dplyr::filter(logFC < 0)
+top <- row.names(res)[1:4]
+
+#subset v by top rownames
+top_v <- v$E[top, ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id")
+
+#pivot longer
+top_v <- pivot_longer(top_v, cols = !gene_id, names_to = "sample", values_to = "voom_cts")
+
+#add metadata by joining with sample_info (move rownames to col first)
+top_v <- left_join(top_v, rownames_to_column(sample_info, var = "sample"), by = "sample")
+
+#convert gene_id to symbol
+top_v <- mutate(top_v, symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+
+Great!
+
+### Compute emperical p values and apply the story fdr correction to these values
+The q value adjustment for multiple testing correction seems to be the superior method to FWER and Benjamini-Hochberg. The only issue with it is when the pvalue distribution is not uniform. In most cases, this is fine, but it is best to use an empirical approach where the pvalues are first corrected based on null pvalues obtained from permutations. 
+
+To do this, we have the following steps:
+1. Permute the variable of interest and calculate the null pvalues, for at least 10 iterations.
+2. Adjust the observed pvalues based on the null/expected pvalues using the emPvals() function from the qvalue package. 
+3. Use the adjusted p values to calculate storey q values. Use these to threshold genes. 
+
+#### Permute the variable of interest and calculate the null pvalues, for at least 10 iterations. 
+Permute the the infection column across all samples so that infection is random and the null is the random effect of that. 
+```{r}
+#function to permute the variable of interest
+permute_si_variable <- function(var, si, n = 10) {
+  # var is the variable of interest
+  # si is the sample info/metadata
+  # n is the number of iterations
+  # this function returns a list of permuted sample info data.frames 
+  
+  #permute the variable of interest
+  x <- rsample::permutations(si, permute = all_of(var), times = n)
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+  for (i in seq(1, n)) {
+    #extract permuted ith iteration
+    si_rand <- x$splits[[i]] %>% rsample::analysis() %>% as.data.frame()
+    
+    #add to list
+    list_x <- rlist::list.append(list_x, si_rand)
+  }
+
+  #return list
+  return(list_x)
+}
+```
+
+```{r}
+#execute function:
+permuted_si <- permute_si_variable(var = "Infection", si = sample_info, n = 10)
+```
+
+Fit permuted data to linear models, use the same model as done in the observed analysis
+```{r}
+fit_permutations <- function(perms, formula, v, n =  10) {
+  # perms is the permuted sample info
+  # formula is the formula used in the respective analysis provided in quotes (ex: "~ Timepoint")
+  # v are the voom tramsformed counts to input into the random/null models. 
+  # n is the number of iterations performed above. 
+  # Returns a list of model fits for the permuted data
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+    for (i in seq(1, n)) {
+      #set up model for ith iteration
+      m_rand <- model.matrix(as.formula(formula), data = as.data.frame(perms[i]))
+    
+      #fit model for each iteration
+      vfit_rand <- lmFit(v, m_rand)
+    
+      #make contrast MtB and NI and apply to model
+      contrast.matrix <- makeContrasts(InfectionMtb-InfectionNI, levels = coef(vfit_rand))
+      vfit_rand <- contrasts.fit(vfit_rand, contrasts=contrast.matrix)
+
+      #compute stats
+      vfit_rand <- eBayes(vfit_rand)
+      
+      #add to list
+      list_x <- rlist::list.append(list_x, vfit_rand)
+    }
+  return(list_x)
+}
+```
+
+```{r}
+permuted_fits <- fit_permutations(perms = permuted_si, formula = "~ 0 + Infection + Timepoint + Donor_ID + flow_cell + perc_GC + perc_Aligned + perc_Dups", v = v, n = 10)
+```
+
+Calculate null pvalues
+```{r}
+get_null_pvals <- function(perm_fits, n =  10) {
+  # perm_fits is the list of model fits for permuted data
+  # n is the number of iterations performed above. 
+  # Returns a vector of pvalues for the contrast between Mtb and NI
+  
+  # create dummy vector
+  vec <- c()
+  
+  #for each iteration, extract the null pvalues between NI and Mtb:
+    for (i in seq(1, n)) {
+      #extract each fit
+      fit <- perm_fits[[i]]
+      
+      #append p.vals to the dummy vector
+      vec <- append(vec, fit$p.value)
+    }
+  return(vec)
+}
+```
+
+```{r}
+null_pvalues <- get_null_pvals(perm_fits = permuted_fits, n = 10)
+```
+
+Check the distribution of null pvalues
+```{r}
+hist(null_pvalues)
+hist(vfit$p.value)
+```
+
+
+Calculate p-values from a set of observed test statistics and simulated null test statistics. 
+
+Note: By transforming the pvalues to -log10, the output doesn't have to be corrected and R does not institute a rounding to zero. The alternative is to use raw pvalues and correct the output of empPval by 1-(output). Tauras explained this is because the function expects effect sizes by default, so it returns the proportion which are larger. If I were to plot empP vs. P, I'd find they're inversely correlated. 
+
+I checked that this seperately and it checks out. 
+
+```{r}
+empPvals <- qvalue::empPvals(stat=-log10(vfit$p.value), stat0=-log10(null_pvalues), pool = T)
+```
+
+Plot dsitributions. 
+```{r}
+hist(empPvals)
+plot(empPvals, vfit$p.value)
+```
+
+Finally, compute Storey qvalues and add to vfit
+```{r}
+qvals <- qvalue::qvalue(p = empPvals)
+```
+
+Plot qvalue distribution to see if it handles the 0s right
+```{r}
+hist(qvals$qvalues)
+plot(qvals$qvalues, qvals$pvalues)
+```
+
+Merge all stats together to join with observed results
+```{r}
+#merge
+sig_stats <- data.frame(obs_pval = c(vfit$p.value), empPvals = empPvals, empirical_qval = qvals$qvalues)
+
+#check that they still correlate with each other
+plot(sig_stats)
+```
+
+Join stats to each gene
+```{r}
+#extract pvals and geneid (rownames)
+pvals <- as.data.frame(vfit$p.value)
+colnames(pvals) <- "p.value"
+
+#bind cols and check that p.val and obs_pval are the same. 
+pvals <- bind_cols(pvals, sig_stats) %>% rownames_to_column("gene_id")
+
+#if TRUE, they are the same
+all(pvals$p.value == pvals$obs_pval)
+```
+
+We want the other stats, like effect size, so get that data using toptable and join.
+```{r}
+res <- topTable(vfit, number = Inf) %>% rownames_to_column("gene_id")
+
+res_qvals <- inner_join(res, pvals, by = "gene_id")
+
+#this prints true if the join worked
+all(res_qvals$P.Value == res_qvals$obs_pval)
+```
+
+Save DEGs with pval < 0.001. Call this "infection-only_DEGs". This is a FDR of 0.1%, so 1 in 1,000 are false. 
+```{r}
+#remove redundant cols 
+res_qvals <- dplyr::select(res_qvals, -obs_pval, -empPvals, -p.value)
+
+#rename adj.P.val
+res_qvals <- dplyr::rename(res_qvals, "limma_adj_pval" = adj.P.Val)
+
+#save all genes
+saveRDS(res_qvals, "results/Mtb-vs-NI_global_results.rds")
+
+#filter DEGs with emperical_qval < 0.001
+DEGs <- dplyr::filter(res_qvals, empirical_qval < 0.001)
+
+#save DEGs
+saveRDS(DEGs, "results/infection-only_DEGs.rds")
+```
+
+##### Plot qvalue distributions
+```{r}
+ggplot(res_qvals, aes(x = empirical_qval)) +
+  geom_histogram(binwidth = 0.001, fill = "ivory", color = "black") +
+  geom_vline(xintercept = 0.001, linetype = "dashed") +
+  geom_text(x = 0.01, y = 5000, label = "q = 0.001", color = "black") +
+  theme_classic()
+```
+
+##### Plot lfc distributions
+```{r}
+ggplot(res_qvals, aes(x = logFC)) +
+  geom_histogram(binwidth = 0.1, fill = "ivory", color = "black") +
+  geom_vline(xintercept = c(-1,1), linetype = "dashed") +
+  geom_text(x = -2, y = 900, label = "LFC +/- 1", color = "black") +
+  theme_classic()
+```
+
+Which pathways are differentially regulated?
+```{r}
+#load Human Molecular Signatures Database (msigdb) pathways
+hallmark_pathways <- fgsea::gmtPathways("../../common-use-files/msigdb_pathways/h.all.v2023.2.Hs.symbols.gmt")
+
+#rank by t stat
+res_rank <- dplyr::arrange(res_qvals, t)
+
+#isolate symbol from rownames
+res_rank <- mutate(res_rank, symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% distinct()
+
+#make rank vector
+ranks <- res_rank$t
+names(ranks) <- res_rank$symbol
+
+#run fgsea
+fgseaRes <- fgsea::fgsea(hallmark_pathways, ranks)
+```
+
+Plot hallmark pathways
+```{r, fig.dim=c(10,8)}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+all_gsea_plot <- fgsea::plotGseaTable(hallmark_pathways[topPathways], ranks, fgseaRes, gseaParam=0.5)
+all_gsea_plot
+```
+So there are immune related pathways shown here: Interferon alpha/gamma response | Inflammatory response | TGF beta signaling
+There are also cell cycle pathways, as haley saw previously. There are also metabolic pathways shown here. 
+
+
+What is happening to key Macrophage Markers?
+```{r,fig.dim=c(8,20)}
+#convert voom table to long format and add metadata and convert gene_id to symbol (I did this above previously in a clearer way).
+top_v <- v$E %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>%
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+#select the genes we care about:
+top_v <- filter(top_v, symbol %in% c("TNF", "IL1A", "IL1B", "IL6", "IL4", "IL10", "IL12A", "IL12B", "IL18", "IL23", "IL27", "TGFB1",
+                                     "CXCL1", "CXCL2", "CCL5", "CXCL8", "CXCL9", "CXCL10", "CXCL10", "HLA-DRA", "HLA-DRB1", "CD80", "CD86", 
+                                     "NFKB1", "NFKB2", "RELA", "RELB", "REL")) 
+
+#order timepoint:
+top_v$Timepoint <- factor(top_v$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"))
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(fill = Infection)) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  theme_bw()
+
+# plot line plot of counts by time for each infection status. Include jittered points. 
+mf_regs_plot <- ggplot(top_v, aes(x = Timepoint_hr, y = voom_cts)) +
+  geom_jitter(aes(group=Infection, color = Infection), alpha = 0.25) +
+  geom_smooth(aes(group=Infection, color = Infection)) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+mf_regs_plot
+
+#combine:
+ggplot(top_v, aes(x = Timepoint, y = voom_cts)) +
+  geom_smooth(aes(group=Infection, color = Infection), se = F) +
+  geom_boxplot(aes(fill = Infection)) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+Hard to tell from the plots in the document, but this is very cool when we blow it up. There are different patterns for these cytokines/factors. 
+
+What is happening to key Cell Cycle Markers?
+```{r, fig.dim=c(8,20)}
+#convert voom table to long format and add metadata and convert gene_id to symbol (I did this above previously in a clearer way).
+top_v <- v$E %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>%
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+#select the genes we care about:
+top_v <- filter(top_v, symbol %in% c("TP53", "MYC", "E2F1", "E2F2", "E2F3", "E2F4", "E2F5", "E2F6", "E2F7", "E2F8", "RB1", "CDK1", "CDK2", "CDK4", "CDK6", "CCNA2", "CCNA2", "CCND1", "CCNB1", "CCNE1")) 
+
+#order timepoint:
+top_v$Timepoint <- factor(top_v$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"))
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(fill = Infection)) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_fill_manual(values = c("grey", "blue")) +
+  theme_bw()
+
+# plot line plot of counts by time for each infection status. Include jittered points. 
+cell_cycle_plot <- ggplot(top_v, aes(x = Timepoint_hr, y = voom_cts)) +
+  geom_jitter(aes(group=Infection, color = Infection), alpha = 0.25) +
+  geom_smooth(aes(group=Infection, color = Infection)) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_color_manual(values = c("grey", "blue")) +
+  theme_bw()
+cell_cycle_plot
+
+#combine:
+ggplot(top_v, aes(x = Timepoint, y = voom_cts)) +
+  geom_smooth(aes(group=Infection, color = Infection), se = F) +
+  geom_boxplot(aes(fill = Infection)) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_fill_manual(values = c("grey", "blue")) +
+  scale_color_manual(values = c("grey", "blue")) +
+  theme_bw()
+```
+
+Woah, it looks like TB actually inhibits the expression of cell cycle regulators? Especially TP53 and RB1, they have all donors displaying this behavior. This is a little odd since the pathogen is heatkilled in this case. It should really just simulate an immune response. In this way, the macrophage might respond by arresting the cell cycle to focus on the infection? Either way, this likely explains why cell cylce pathways are the most differentially expressed pathways. 
+
+Next plan is to model looking at timepoint-infection effect to identify differences at each Timepoint.  
+
+## Model infection:timepoint nested model:
+
+Model: ~ 0 + Timepoint:Infection + Timepoint + Donor_ID + perc_GC + perc_Dups + perc_Aligned + flow_cell
+
+### Fit data to model
+#### Read in sample info and set design
+
+I want to model the infection, to identify genes that respond to infection at all timepoints across all donors. The covariates here are GC, Dups, Aligned, and flow_cell. See EDA_limma.Rmd for PCAs and UMAPs.
+
+By including timepoint, we estimate the "main effects" from the timepoint variable and regress that out. In doing this it also estimates an intercept for each timepoint. Plus, without timepoint, it reports coeficients for all combinatinos of timepoint and infection. 
+```{r}
+#set design matrix for filtered data and all
+design_nested <- model.matrix( ~ 0 + Timepoint:Infection + Timepoint + Donor_ID + perc_GC + perc_Dups + perc_Aligned + flow_cell, data = sample_info)
+```
+
+#### Fit model and compute empirical bayes statistics for contrasts
+```{r}
+#fit model
+vfit_nested <-lmFit(v, design_nested)
+
+#compute stats
+vfit_nested <- eBayes(vfit_nested)
+```
+
+#### Plot residual variance vs. expression SA plot
+```{r}
+plotSA(vfit_nested)
+```
+
+#### Check that model is working per timepoint
+
+```{r}
+#T1
+res <- topTable(vfit_nested, coef = "TimepointT1:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T3
+res <- topTable(vfit_nested, coef = "TimepointT3:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T3")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T5
+res <- topTable(vfit_nested, coef = "TimepointT5:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T5")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T8
+res <- topTable(vfit_nested, coef = "TimepointT8:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T8")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T12
+res <- topTable(vfit_nested, coef = "TimepointT12:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T12")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T18
+res <- topTable(vfit_nested, coef = "TimepointT18:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T18")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T24
+res <- topTable(vfit_nested, coef = "TimepointT24:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T24")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T30
+res <- topTable(vfit_nested, coef = "TimepointT30:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T30")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+```{r}
+#T36
+res <- topTable(vfit_nested, coef = "TimepointT36:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T36")
+ggplot(top_v, aes(x = Infection, y = voom_cts)) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_bw()
+```
+
+### Get emperical qvalues
+Use the same procedure as done for global infection effects, but permute infection within timepoints. 
+
+#### Permute the variable of interest and calculate the null pvalues, for at least 10 iterations. 
+Permute the the infection column within timepoint so that infection is random and the null is the random effect of that. 
+```{r}
+#function to permute the variable of interest
+permute_si_variable_within_category <- function(var, si, cat, n = 10) {
+  # var is the variable of interest
+  # si is the sample info/metadata
+  # cat is the category/variable to permute within (must be a factor)
+  # n is the number of iterations
+  # this function returns a list of permuted sample info data.frames 
+  
+  # create dummy list
+  list_x <- list()
+  
+  #split the si into the individual factors of the cat and permute var
+  for (category in levels(sample_info[,cat])) {
+    #split si
+    x <- sample_info[sample_info[,cat] == category, ]
+    
+    #permute
+    x <- rsample::permutations(x, permute = all_of(var), times = n)
+    
+    #add to list
+    list_x[[category]] <- x
+  }
+
+  #for each iteration, extract permutations for each timepoint and join back together
+  
+  #make another dummy list
+  list_y <- list()
+  
+  for (i in seq(1, n)) {
+    #make dummy df 
+    df <- data.frame()
+    
+    for (category in levels(sample_info[,cat])) {
+        x <- list_x[[category]] 
+        x <- x$splits[[i]] %>% rsample::analysis() %>% as.data.frame()
+        df <- rbind(df, x)
+    }
+    
+    #add df to list
+    list_y[[i]] <- df
+  }
+  #return the list
+  return(list_y)
+}
+```
+
+```{r}
+#execute function:
+permuted_si_perTime <- permute_si_variable_within_category(var = "Infection", si = sample_info, cat = "Timepoint", n = 10)
+```
+
+Fit permuted data to linear models, use the same model as done in the observed analysis
+```{r}
+fit_permutations <- function(perms, formula, v, n =  10) {
+  # perms is the permuted sample info
+  # formula is the formula used in the respective analysis provided in quotes (ex: "~ Timepoint")
+  # v are the voom tramsformed counts to input into the random/null models. 
+  # n is the number of iterations performed above. 
+  # Returns a list of model fits for the permuted data
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+    for (i in seq(1, n)) {
+      #set up model for ith iteration
+      m_rand <- model.matrix(as.formula(formula), data = as.data.frame(perms[i]))
+    
+      #fit model for each iteration
+      vfit_rand <- lmFit(v, m_rand)
+      
+      #compute stats
+      vfit_rand <- eBayes(vfit_rand)
+      
+      #add to list
+      list_x <- rlist::list.append(list_x, vfit_rand)
+    }
+  return(list_x)
+}
+```
+
+```{r}
+permuted_fits <- fit_permutations(perms = permuted_si_perTime, formula = "~ 0 + Timepoint:Infection + Timepoint + Donor_ID + perc_GC + perc_Dups + perc_Aligned + flow_cell", v = v, n = 10)
+```
+
+Calculate null pvalues
+```{r}
+get_null_pvals <- function(perm_fits, n =  10) {
+  # perm_fits is the list of model fits for permuted data
+  # n is the number of iterations performed above. 
+  # cat is the category/variable that was permuted within (must be a factor). This is used to identify the individual categories to get pvalues for. 
+  # Returns a vector of pvalues for the contrast between Mtb and NI
+  
+  # create dummy df
+  df <- data.frame()
+  
+  #for each iteration, extract the null pvalues between NI and Mtb:
+    for (i in seq(1, n)) {
+      #for each iteration, append p.vals to the dummy df
+      x <- as.data.frame(perm_fits[[i]]$p.value)
+      df <- dplyr::bind_rows(df, x)
+    }
+  return(df)
+}
+```
+
+```{r}
+null_pvalues <- get_null_pvals(perm_fits = permuted_fits, n = 10)
+```
+
+Check the distribution of null pvalues
+```{r}
+hist(as.matrix(null_pvalues)[, 44:52])
+hist(vfit_nested$p.value[, 44:52])
+```
+
+
+For each nested model, calculate p-values from a set of observed test statistics and simulated null test statistics. 
+
+Note: the output of empPval needs to be corrected by 1-value. Tauras explained this is because the function expects effect sizes by default, so it returns the proportion which are larger. If I were to plot empP vs. P, I'd find they're inversely correlated. 
+
+```{r}
+#make pval and se dfs
+obs_pvals <- as.data.frame(vfit_nested$p.value)
+SE <- sqrt(vfit_nested$s2.post) * vfit_nested$stdev.unscaled
+
+
+#setup list to iterate through
+timepoint_list <- list("TimepointT1:InfectionMtb", "TimepointT3:InfectionMtb", "TimepointT5:InfectionMtb", "TimepointT8:InfectionMtb", "TimepointT12:InfectionMtb", 
+                       "TimepointT18:InfectionMtb", "TimepointT24:InfectionMtb", "TimepointT30:InfectionMtb", "TimepointT36:InfectionMtb")
+
+#run through list to extract qvalues for each
+for (i in timepoint_list) {
+  emperical_pvals <- qvalue::empPvals(stat = -log10(obs_pvals[, i]), stat0 = -log10(null_pvalues[, i]), pool = T)
+  qvals <- qvalue::qvalue(p = emperical_pvals)
+  
+  #merge
+  tmp1 <- data.frame(obs_pval = obs_pvals[, i], empirical_qval = qvals$qvalues)
+  
+  #get pvalues just for the timepoint
+  tmp2 <- dplyr::select(obs_pvals, all_of(i))
+  colnames(tmp2) <- "p.value"
+  
+  #join to each gene
+  tmp3 <- bind_cols(tmp2, tmp1) %>% rownames_to_column("gene_id")
+  
+  #stop if the row order is not the same
+  if (all(tmp3$p.value == tmp3$obs_pval) == FALSE) {
+    stop()
+  }
+  
+  #remove redundant col
+  tmp3 <- dplyr::select(tmp3, -p.value)
+  
+  #get the stats
+  tmp4 <- data.frame(coefficients = c(vfit_nested$coefficients[, i]), 
+                     t_statistic = c(vfit_nested$t[, i]), 
+                     coef_se = c(SE[, i]), 
+                     p.value = c(vfit_nested$p.value[, i])) %>% rownames_to_column("gene_id")
+  
+  #join
+  tmp5 <- inner_join(tmp4, tmp3, by = "gene_id")
+  
+  #stop if join doesn't work properly
+  if (all(tmp5$p.value == tmp5$obs_pval) == FALSE) {
+    stop()
+  }
+  #remove redundant col 
+  tmp5 <- dplyr::select(tmp5, -obs_pval)
+
+  #assign ttmp5
+  assign(value = tmp5, x = paste0(i, "_results"))
+  
+  #remove tmps
+  rm(tmp1, tmp2, tmp3, tmp4, tmp5)
+}
+```
+
+### Number of DEGs per timepoint
+Now that we have emprical qvalues, we will threshold with LFC and a qval.
+
+Plot distributions to make an educated choice on the threshold. 
+```{r}
+hist(`TimepointT1:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT3:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT5:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT8:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT12:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT18:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT24:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT30:InfectionMtb_results`$empirical_qval, breaks = 100)
+hist(`TimepointT36:InfectionMtb_results`$empirical_qval, breaks = 100)
+```
+
+Probably 0.01 is the best q val threshold. 
+
+LFC
+```{r}
+hist(`TimepointT1:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT3:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT5:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT8:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT12:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT18:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT24:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT30:InfectionMtb_results`$coefficients, breaks = 100)
+hist(`TimepointT36:InfectionMtb_results`$coefficients, breaks = 100)
+```
+
+Yeah +/-1 is probably right. 
+
+Report number of DEGs via qval
+```{r}
+dplyr::filter(`TimepointT1:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT3:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT5:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT8:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT12:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT18:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT24:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT30:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+dplyr::filter(`TimepointT36:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% nrow()
+```
+
+Plot
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")), 
+                          number_DEGs = c(188, 1378, 1937, 2018, 1989, 2122, 1942, 1884, 1903))
+
+degs_plot <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = 1)) +
+  geom_line(color="grey20") +
+  geom_point(size = 3) +
+  labs(y = "Number of DEGs", x  ="Timepoint",
+       title = "Number of genes responding to Mtb infection per timepoint", 
+       subtitle = "Thresholds: Log Fold-Change +/-1 & emperical q-value < 0.001") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+degs_plot
+```
+
+#### Use mash to better estimate effect sizes and calculate lfsr as a threshold. 
+
+Prepare matricies
+```{r}
+betas <- data.frame("T1" = `TimepointT1:InfectionMtb_results`$coefficients, "T3" = `TimepointT3:InfectionMtb_results`$coefficients, "T5" = `TimepointT5:InfectionMtb_results`$coefficients,
+                    "T8" = `TimepointT8:InfectionMtb_results`$coefficients, "T12" = `TimepointT12:InfectionMtb_results`$coefficients, "T18" = `TimepointT18:InfectionMtb_results`$coefficients,
+                    "T24" = `TimepointT24:InfectionMtb_results`$coefficients, "T30" = `TimepointT30:InfectionMtb_results`$coefficients, "T36" = `TimepointT36:InfectionMtb_results`$coefficients, 
+                    row.names = `TimepointT1:InfectionMtb_results`$gene_id) %>% as.matrix()
+
+standard_errors <- data.frame("T1" = `TimepointT1:InfectionMtb_results`$coef_se, "T3" = `TimepointT3:InfectionMtb_results`$coef_se, "T5" = `TimepointT5:InfectionMtb_results`$coef_se,
+                              "T8" = `TimepointT8:InfectionMtb_results`$coef_se, "T12" = `TimepointT12:InfectionMtb_results`$coef_se, "T18" = `TimepointT18:InfectionMtb_results`$coef_se,
+                              "T24" = `TimepointT24:InfectionMtb_results`$coef_se, "T30" = `TimepointT30:InfectionMtb_results`$coef_se, "T36" = `TimepointT36:InfectionMtb_results`$coef_se, 
+                              row.names = `TimepointT1:InfectionMtb_results`$gene_id) %>% as.matrix()
+```
+
+Mash is a series of 4 steps and there are different ways to run it. One thing you can do is account for correlations across measurements. I'm unsure if we should do this, so we will try with and without and compare. 
+
+Without correction
+```{r}
+library(mashr)
+
+## Step 1: Read in the data and account for correlations among measurements
+#read in data
+data = mash_set_data(betas, standard_errors)
+
+## Step 2: Set up the covariance matrices
+#Step 2a: Canonical
+U.c = cov_canonical(data)
+
+## Step 2b: Obtain data-driven covariance matrices
+#Select strong signals
+m.1by1 = mash_1by1(data)
+strong = get_significant_results(m.1by1, thresh = 1e-50) # this gives 3,300 genes 
+strong_betas <- betas[strong,]
+
+#obtain initial data_driven covariance matrices
+U.pca = cov_pca(data, 2, subset=strong)
+
+#perform extreme deconvolution
+U.ed = cov_ed(data, U.pca, subset=strong)
+
+#Step 3: fit the model
+m = mash(data, c(U.c,U.ed))
+print(get_loglik(m),digits = 10)
+
+#Step 4: Extract Posterior Summaries
+mashed_betas <- get_pm(m) %>% as.data.frame()
+mashed_se <- get_psd(m) %>% as.data.frame()
+mashe_lfsr <- get_lfsr(m) %>% as.data.frame()
+```
+
+With correction
+```{r}
+library(mashr)
+
+## Step 1: Read in the data and account for correlations among measurements
+#read in data
+data = mash_set_data(betas, standard_errors)
+
+#estimate correlations
+V.simple = estimate_null_correlation_simple(data)
+data.Vsimple = mash_update_data(data, V=V.simple)
+
+## Step 2: Set up the covariance matrices
+#Step 2a: Canonical
+U.c_V = cov_canonical(data.Vsimple)
+
+## Step 2b: Obtain data-driven covariance matrices
+#Select strong signals
+m.1by1_V = mash_1by1(data.Vsimple)
+strong_V = get_significant_results(m.1by1_V, thresh = 1e-50) # this gives 3,300 genes 
+strong_betas_V <- betas[strong_V,]
+
+#obtain initial data_driven covariance matrices
+U.pca_V = cov_pca(data.Vsimple, 2, subset=strong_V)
+
+#perform extreme deconvolution
+U.ed_V = cov_ed(data.Vsimple, U.pca_V, subset=strong_V)
+
+#Step 3: fit the model
+m_V = mash(data.Vsimple, c(U.c_V,U.ed_V))
+print(get_loglik(m_V),digits = 10)
+
+#Step 4: Extract Posterior Summaries
+mashed_betas_V <- get_pm(m_V) %>% as.data.frame()
+mashed_se_V <- get_psd(m_V) %>% as.data.frame()
+mashed_lfsr_V <- get_lfsr(m_V) %>% as.data.frame()
+```
+
+The correction has a better log likelihood. So we will go with that one. 
+
+#### Get DEGs using mash stats 
+Plot distributions to make an educated choice on the threshold. 
+```{r, fig.height=8, fig.height=10}
+mashed_betas_V_long <- pivot_longer(mashed_betas_V, cols = everything(), names_to = "Timepoint", values_to = "Mashed_Betas")
+mashed_betas_V_long$Timepoint <- factor(mashed_betas_V_long$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"))
+
+mashed_lfsr_V_long <- pivot_longer(mashed_lfsr_V, cols = everything(), names_to = "Timepoint", values_to = "Mashed_lfsr")
+mashed_lfsr_V_long$Timepoint <- factor(mashed_lfsr_V_long$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"))
+
+ggplot(data = mashed_betas_V_long, aes(x = Mashed_Betas, fill = Timepoint)) +
+  geom_histogram(binwidth = 0.1, lwd = 0.5, color = "black") +
+  geom_vline(xintercept = c(-1,1), linetype = "dashed") +
+  facet_wrap(~Timepoint, ncol = 3, scales = "free_y") +
+  ggsci::scale_fill_uchicago() +
+  theme_bw()
+
+ggplot(data = mashed_lfsr_V_long, aes(x = Mashed_lfsr, fill = Timepoint)) +
+  geom_histogram(binwidth = 5e-3, lwd = 0.5, color = "black") +
+  geom_vline(xintercept = c(0.1, 0.05, 0.01), linetype = "dashed") +
+  facet_wrap(~Timepoint, ncol = 3, scales = "free_y") +
+  ggsci::scale_fill_uchicago() +
+  theme_bw()
+```
+
+Use 0.01 lsfr and +/-1 beta:
+```{r}
+#join betas and lsfr:
+mashed_results <- mashed_betas_V %>% rownames_to_column("gene_id") %>% pivot_longer(cols = 2:last_col(), names_to = "Timepoint", values_to = "Mashed_Betas")
+
+mashed_results <- mashed_lfsr_V %>% rownames_to_column("gene_id") %>% pivot_longer(cols = 2:last_col(), names_to = "Timepoint", values_to = "lfsr") %>% left_join(x = mashed_results, by = c("gene_id", "Timepoint"))
+```
+
+Filter
+```{r}
+mashed_result_sig <- dplyr::filter(mashed_results, lfsr < 0.01 & (Mashed_Betas > 1 | Mashed_Betas < -1))
+```
+
+How many genes total?
+```{r}
+as.data.frame(mashed_result_sig$gene_id) %>% distinct() %>% nrow()
+```
+
+How many genes per timepoint?
+```{r}
+for (i in c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")) {
+  print(i)
+  dplyr::filter(mashed_result_sig, Timepoint == i)[, "gene_id"] %>% as.data.frame() %>% distinct() %>% nrow() %>% print()
+}
+```
+
+```{r}
+number_DEGs_mash <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")), 
+                          number_DEGs = c(141, 1296, 1806, 1902, 1883, 2036, 1892, 1846, 1880))
+
+degs_plot_mash <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = 1)) +
+  geom_line(color="steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  labs(y = "Number of DEGs", x  ="Timepoint",
+       title = "Number of genes responding to Mtb infection per timepoint - mashed data", 
+       subtitle = "Thresholds: LogFC +/-1 & lfsr < 0.001") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+degs_plot_mash
+```
+
+The numbers are effectively the same. Lets see how well they overlap? 
+```{r}
+tmp1 <- dplyr::filter(`TimepointT1:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T1")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT3:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T3")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT5:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T5")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT8:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T8")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT12:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T12")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT18:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T18")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT24:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T24")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT30:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T30")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+```{r}
+tmp1 <- dplyr::filter(`TimepointT36:InfectionMtb_results`, empirical_qval < 0.01 & (coefficients > 1 | coefficients < -1)) %>% dplyr::select(gene_id)
+tmp2 <- dplyr::filter(mashed_result_sig, Timepoint == "T36")[, "gene_id"] %>% as.data.frame() %>% distinct()
+tmp3 <- inner_join(tmp1, tmp2, by = "gene_id")
+nrow(tmp1)
+nrow(tmp2)
+nrow(tmp3)
+```
+
+Mostly they overlap. It is probably better to use the lfsr, so we will do that for clustering. 
+
+Save DEGs for all timepoints and indiividual timepoints:
+```{r}
+for (i in c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")) {
+  tmp <- dplyr::filter(mashed_result_sig, Timepoint == i)
+  saveRDS(tmp, file = paste0("results/timepoint_specific_", i, "_DEGs.RDS"))
+  assign(value = tmp, x = paste0("DEGs_", i))
+  rm(tmp)
+}
+
+DEGs_all <- mashed_result_sig[, "gene_id"] %>% as.data.frame() %>% distinct()
+saveRDS(object = DEGs_all, file = paste0("results/timepoint_specific_all_DEGs.RDS"))
+```
+
+
+Next move on to GSEA. 
+
+### GSEA at each timepoint
+
+Load hallmark pathways
+```{r}
+#load Human Molecular Signatures Database (msigdb) pathways
+hallmark_pathways <- fgsea::gmtPathways("../../common-use-files/msigdb_pathways/h.all.v2023.2.Hs.symbols.gmt")
+```
+
+Loop through each timepoint following a similar process as done in the global analysis.
+```{r}
+#setup list to iterate through
+timepoint_results_list <- list("T1" = `TimepointT1:InfectionMtb_results`, "T3" = `TimepointT3:InfectionMtb_results`, "T5" = `TimepointT5:InfectionMtb_results`, "T8" = `TimepointT8:InfectionMtb_results`, 
+                               "T12" = `TimepointT12:InfectionMtb_results`, "T18" = `TimepointT18:InfectionMtb_results`, "T24" = `TimepointT24:InfectionMtb_results`, 
+                               "T30" = `TimepointT30:InfectionMtb_results`, "T36" = `TimepointT36:InfectionMtb_results`)
+
+#make dummy list
+gsea_list <- list()
+
+for (i in names(timepoint_results_list)) {
+  #print element
+  print(i)
+  #assign to res
+  res <- timepoint_results_list[[i]]
+  #rank by t stat
+  rank <- dplyr::arrange(res, t_statistic)
+  #isolate symbol from gene_id - run distinct to make sure there are no duplicates
+  rank <- mutate(rank, symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% distinct()
+  #make rank vector
+  rank_vec <- rank$t_statistic
+  names(rank_vec) <- rank$symbol
+  #run fgsea
+  fgseaRes <- fgsea::fgsea(hallmark_pathways, rank_vec, nproc=1)
+  #append to list
+  gsea_list[[i]] <- fgseaRes
+  #remove vars
+  rm(res, rank, rank_vec, fgseaRes)
+}
+```
+
+Select pathways with padj < 0.001 and a NES > +/- 1.5 in at least one timepoint. 
+```{r}
+select_top_pathways <- function(res) {
+  sig <- as.data.frame(res) %>% dplyr::filter(padj < 0.001)
+  top <- dplyr::filter(sig, NES > 1.5)
+  bottom <- dplyr::filter(sig, NES < -1.5)
+  return(dplyr::bind_rows(top, bottom))
+}
+
+gsea_sig_list <- lapply(gsea_list, FUN = select_top_pathways)
+
+sig_pathways <- c(gsea_sig_list$T1$pathway, gsea_sig_list$T3$pathway, gsea_sig_list$T5$pathway, gsea_sig_list$T8$pathway,
+                  gsea_sig_list$T12$pathway, gsea_sig_list$T16$pathway, gsea_sig_list$T24$pathway, gsea_sig_list$T30$pathway, gsea_sig_list$T36$pathway) %>% unique() %>% as.data.frame()
+colnames(sig_pathways) <- "pathway"
+```
+
+Now that we have top pathways, extract NES from each timepoint and put into a dataframe
+```{r}
+for (i in c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")) {
+  #extract timepoint
+  res <- gsea_list[[i]] %>% as.data.frame()
+  #intersect with sig pathways
+  res <- inner_join(res, sig_pathways, by = "pathway")
+  #parse if fiirst time to add pathway
+  if (i == "T1") {
+    gsea_sig_df <- dplyr::transmute(res, pathway, !!i := NES)
+  }
+  if (i != "T1") {
+  #add to a new column of df
+    res <- dplyr::transmute(res, pathway, !!i := NES)
+    gsea_sig_df <- left_join(gsea_sig_df, res, by = "pathway")
+  }
+  rm(res)
+}
+```
+
+Pivot longer
+```{r}
+#order by mean NES
+gsea_sig_df <- mutate(gsea_sig_df, mean_NES = rowMeans(across(-1))) %>%
+  arrange(desc(mean_NES)) %>%
+  select(1, everything()) %>% dplyr::select(-mean_NES)
+
+#remove "hallmark_" from each pathway
+gsea_sig_df <- mutate(gsea_sig_df, pathway = str_remove(pathway, "HALLMARK_"))
+
+gsea_sig_df$pathway <- factor(gsea_sig_df$pathway, levels = rev(c(gsea_sig_df$pathway)))
+
+gsea_sig_df <- pivot_longer(gsea_sig_df, cols = 2:last_col(), names_to = "Timepoint", values_to = "NES")
+
+gsea_sig_df$Timepoint <- factor(gsea_sig_df$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"))
+```
+
+Plot results as a heatmap with x=time, y=pathway, color=NES
+```{r, fig.width=7.5, fig.height=8}
+library(RColorBrewer)
+my_palette <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(50)
+
+gsea_heatmap <- ggplot(gsea_sig_df, aes(x = Timepoint, y = pathway, fill = NES)) +
+  geom_tile(color = "white", lwd = 0.5) +
+  scale_fill_gradientn(colors = my_palette) +
+  labs(title = "Gene Set Enrichment Analysis of Mtb Infection for each Timepoint",
+       subtitle = "*only pathways with padj < 0.001 and a NES > +/- 1.5\nin at least one timepoint are shown",
+       x = "Time Post-Infection (hrs)", 
+       y = "Hallmark Pathways") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+        plot.subtitle = element_text(hjust = 0.5, face = "italic"), 
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  coord_equal()
+
+gsea_heatmap
+```
+
+### Clustering
+We will cluster behaviors over time for the DEGs. We will do the following process:
+
+1. With mashed betas, extract only the genes that are differentially expressed in at least one timepoint. 
+2. Mean center the mashed beta values. 
+3. Then cluster either with kmeans and using an elbow plot to help chose cluster number. 
+4. Assign cluster ids to each gene and then perform overrepresentation pathway analysis using all expressed genes as the universe. 
+
+Widen mashed_result_sig
+```{r}
+mashed_results_wide <- dplyr::select(mashed_results, -lfsr) %>% pivot_wider(names_from = Timepoint, values_from = Mashed_Betas)
+```
+
+Intersect with all DEGs
+```{r}
+mashed_results_all_DEGs <- inner_join(mashed_results_wide, DEGs_all, by = "gene_id") %>% column_to_rownames("gene_id") %>% as.matrix()
+```
+
+
+#### Mean center betas
+
+We do this with scale, which will center the data by subtracting the mean. We do not want scaling on. 
+```{r}
+mashed_betas_degs_MC <- apply(mashed_results_all_DEGs, 1, function(x) scale(x, scale = FALSE)) %>% t() %>% as.data.frame()
+colnames(mashed_betas_degs_MC) <- colnames(mashed_results_all_DEGs) 
+```
+
+Checked the worked by plotting betas. There should be a normal distribution centered on 0. 
+```{r}
+hist(c(as.matrix(mashed_betas_degs_MC)), breaks = 100)
+```
+
+Sweet, it worked. 
+
+#### Cluster Betas
+
+Estimate the number of clusters
+```{r}
+library(factoextra)
+library(cluster)
+
+#elbow plot
+elbow <- fviz_nbclust(x = mashed_betas_degs_MC, kmeans, method = "wss", k.max = 20)
+elbow
+
+#silhouette
+fviz_nbclust(x = mashed_betas_degs_MC, kmeans, method = "silhouette", k.max = 20)
+```
+
+Idk, this wasn't to helpful. Try k=9 since there are 9 timepoints?
+
+Look at distances to see if this makes sense
+```{r, fig.dim=c(20,18)}
+fviz_dist(get_dist(mashed_betas_degs_MC), gradient = list(low = "blue", mid = "white", high = "red"), show_labels = F)
+```
+
+
+```{r}
+set.seed(1993)
+km_9 <- kmeans(mashed_betas_degs_MC, centers = 9, nstart = 25)
+```
+
+Visualize
+```{r}
+fviz_cluster(km_9, mashed_betas_degs_MC, labelsize = 0, show.clust.cent = T)
+```
+
+Add cluster information to betas:
+```{r}
+mashed_betas_degs_MC_clust <- mutate(as.data.frame(mashed_betas_degs_MC), Cluster_9 = km_9$cluster)
+```
+
+#### Vizualize Clusters
+
+##### Betas
+
+Plot beta by time for each cluster
+```{r, fig.height=20, fig.width=4}
+#add number of genes per cluster
+n <- count(mashed_betas_degs_MC_clust, Cluster_9)
+
+#join
+mashed_betas_degs_MC_clust <- rownames_to_column(mashed_betas_degs_MC_clust, "gene_id") %>% left_join(n, by = "Cluster_9")
+
+#make long
+mashed_betas_degs_MC_clust_long <- pivot_longer(mashed_betas_degs_MC_clust, cols = c(2:10), names_to = "timepoint", values_to = "mean_centered_Beta")
+
+#make timepoint_hr column
+mashed_betas_degs_MC_clust_long <- mutate(mashed_betas_degs_MC_clust_long, timepoint_hr = str_remove(timepoint, pattern = "T"))
+
+#change data types
+mashed_betas_degs_MC_clust_long$timepoint_hr <- as.numeric(mashed_betas_degs_MC_clust_long$timepoint_hr)
+mashed_betas_degs_MC_clust_long$Cluster_9 <- factor(mashed_betas_degs_MC_clust_long$Cluster_9)
+
+#add "cluster_" before cluster_id
+mashed_betas_degs_MC_clust_long <- mutate(mashed_betas_degs_MC_clust_long, cluster_id = paste0("Cluster ", Cluster_9))
+
+clusters_plot <- ggplot(mashed_betas_degs_MC_clust_long, aes(x = timepoint_hr, y=mean_centered_Beta, color = cluster_id)) +
+  geom_jitter(alpha = 0.1) +
+  geom_smooth(method = "loess") +
+  geom_text(aes(label = paste0("N = ", n)), x = 30, y = -2) +
+  facet_wrap(~cluster_id, ncol = 1, scales = "free_y") +
+  ggsci::scale_color_npg() +
+  labs(title = "Behavior of kmeans clusters over time",
+       x = "Timepoint", y = "Adjusted LogFC (Mtb/NI)", 
+       subtitle = "*for differentially expressed genes only") +
+  theme_minimal() +
+  theme(legend.position = "none", title = element_text(size = 8, face = "bold"), 
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+clusters_plot
+```
+
+The clusters look pretty good. Some of them are similar. After looking at it closely, it seems there are 6 main patterns:
+1) Rapid and high magnitude upregulation
+2) Rapid and low magnitude upregulation
+3) Inital rapid upregulation with a return to inital ("rebound up")
+4) Slow upregulation
+5) Downregulation with a return to inital ("rebound down")
+6) Persistent downregulation
+
+Let's try others: 
+k=6
+
+```{r}
+set.seed(1993)
+km_6 <- kmeans(mashed_betas_degs_MC, centers = 6, nstart = 25)
+fviz_cluster(km_6, mashed_betas_degs_MC, labelsize = 0, show.clust.cent = T)
+```
+
+```{r, fig.height=20, fig.width=4}
+mashed_betas_degs_MC_clust <- mutate(as.data.frame(mashed_betas_degs_MC), Cluster_6 = km_6$cluster)
+
+#add number of genes per cluster
+n <- count(mashed_betas_degs_MC_clust, Cluster_6)
+
+#join
+mashed_betas_degs_MC_clust <- rownames_to_column(mashed_betas_degs_MC_clust, "gene_id") %>% left_join(n, by = "Cluster_6")
+
+#make long
+mashed_betas_degs_MC_clust_long <- pivot_longer(mashed_betas_degs_MC_clust, cols = c(2:10), names_to = "timepoint", values_to = "mean_centered_Beta")
+
+#make timepoint_hr column
+mashed_betas_degs_MC_clust_long <- mutate(mashed_betas_degs_MC_clust_long, timepoint_hr = str_remove(timepoint, pattern = "T"))
+
+#change data types
+mashed_betas_degs_MC_clust_long$timepoint_hr <- as.numeric(mashed_betas_degs_MC_clust_long$timepoint_hr)
+mashed_betas_degs_MC_clust_long$Cluster_6 <- factor(mashed_betas_degs_MC_clust_long$Cluster_6)
+
+#add "cluster_" before cluster_id
+mashed_betas_degs_MC_clust_long <- mutate(mashed_betas_degs_MC_clust_long, cluster_id = paste0("Cluster ", Cluster_6))
+
+clusters_plot_6 <- ggplot(mashed_betas_degs_MC_clust_long, aes(x = timepoint_hr, y=mean_centered_Beta, color = cluster_id)) +
+  geom_jitter(alpha = 0.1) +
+  geom_smooth(method = "loess") +
+  geom_text(aes(label = paste0("N = ", n)), x = 30, y = -2) +
+  facet_wrap(~cluster_id, ncol = 1, scales = "free_y") +
+  ggsci::scale_color_npg() +
+  labs(title = "Behavior of kmeans clusters over time",
+       x = "Timepoint", y = "Adjusted LogFC (Mtb/NI)", 
+       subtitle = "*for differentially expressed genes only") +
+  theme_minimal() +
+  theme(legend.position = "none", title = element_text(size = 8, face = "bold"), 
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+clusters_plot_6
+```
+
+You loose the slow up response pattern, which I do not want to lose. Try k=7. 
+
+```{r}
+set.seed(1993)
+km_7 <- kmeans(mashed_betas_degs_MC, centers = 7, nstart = 25)
+fviz_cluster(km_7, mashed_betas_degs_MC, labelsize = 0, show.clust.cent = T)
+```
+```{r, fig.height=14, fig.width=8}
+mashed_betas_degs_MC_clust <- mutate(as.data.frame(mashed_betas_degs_MC), Cluster_7 = km_7$cluster)
+
+#add number of genes per cluster
+n <- count(mashed_betas_degs_MC_clust, Cluster_7)
+
+#join
+mashed_betas_degs_MC_clust <- rownames_to_column(mashed_betas_degs_MC_clust, "gene_id") %>% left_join(n, by = "Cluster_7")
+
+#make long
+mashed_betas_degs_MC_clust_long <- pivot_longer(mashed_betas_degs_MC_clust, cols = c(2:10), names_to = "timepoint", values_to = "mean_centered_Beta")
+
+#make timepoint_hr column
+mashed_betas_degs_MC_clust_long <- mutate(mashed_betas_degs_MC_clust_long, timepoint_hr = str_remove(timepoint, pattern = "T"))
+
+#change data types
+mashed_betas_degs_MC_clust_long$timepoint_hr <- as.numeric(mashed_betas_degs_MC_clust_long$timepoint_hr)
+
+#add "cluster_" before cluster_id
+mashed_betas_degs_MC_clust_long <- mutate(mashed_betas_degs_MC_clust_long, cluster_id = paste0("Cluster ", Cluster_7))
+
+#reorder so up are on one side and down are on the other
+mashed_betas_degs_MC_clust_long$cluster_id <- factor(mashed_betas_degs_MC_clust_long$cluster_id, levels = c("Cluster 1", "Cluster 6", 
+                                                                                                          "Cluster 2", "Cluster 3", 
+                                                                                                          "Cluster 7", "Cluster 5", 
+                                                                                                          "Cluster 4"))
+
+clusters_plot <- ggplot(mashed_betas_degs_MC_clust_long, aes(x = timepoint_hr, y=mean_centered_Beta, color = cluster_id)) +
+  geom_jitter(alpha = 0.05) +
+  geom_smooth(method = "loess", formula = y ~ x) +
+  geom_text(aes(label = paste0("N = ", n)), x = 30, y = -2) +
+  #geom_vline(xintercept = c(5, 10), linetype = "dotted") +
+  #geom_hline(yintercept = c(1, -0.5), linetype = "dotted") +
+  facet_wrap(~cluster_id, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = c("#FF0000", "#006BD1", 
+                                "#DB0000", "#0061C6",
+                                "#B80000", "#00277C",
+                                "#960000")) +
+  scale_y_continuous(breaks = c(-4,-3,-2,-1,0,1,2,3,4)) +
+  scale_x_continuous(breaks = seq(0,40,5)) +
+  labs(title = "Behavior of kmeans clusters over time",
+       x = "Time After Infection (hr)", y = "Adjusted LogFC (Mtb/NI)", 
+       subtitle = "*for differentially expressed genes only") +
+  theme_minimal() +
+  theme(legend.position = "none", title = element_text(size = 8, face = "bold"), 
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+clusters_plot
+```
+
+Yeah 7 looks right. We keep the inital 6 main response patterns and find a slow downregulated response. 
+
+Cluster:
+1) upregulated - rapid - rebound
+2) upregulated - rapid - persistent - small magnitude
+3) downregulated - rapid - persistent
+4) upregulated - slow - persistent
+5) downregulated - slow - persistent
+6) downregulated - rapid - rebound
+7) upregulated - rapid - persistent - large magnitude
+
+This is just the betas for each gene. Now let's add back the counts and see those trends. 
+
+##### Counts
+```{r}
+tmp <- as.data.frame(v$E) %>% rownames_to_column("gene_id")
+voom_counts_DEGs_clusters <- left_join(mashed_betas_degs_MC_clust, tmp, by = "gene_id")
+rm(tmp)
+
+#drop betas and make long
+voom_counts_DEGs_clusters_long <- voom_counts_DEGs_clusters[,-c(2:10)] %>%
+  pivot_longer(cols = c(4:last_col()), names_to = "filename", values_to = "voom_cts")
+
+#add metadata:
+tmp <- rownames_to_column(sample_info, "filename")
+voom_counts_DEGs_clusters_long <- left_join(voom_counts_DEGs_clusters_long, tmp, by = "filename")
+rm(tmp)
+
+#change data type
+voom_counts_DEGs_clusters_long$Cluster_7 <- factor(voom_counts_DEGs_clusters_long$Cluster_7)
+
+#add "cluster_" before cluster_id
+voom_counts_DEGs_clusters_long <- mutate(voom_counts_DEGs_clusters_long, cluster_id = paste0("Cluster ", Cluster_7))
+
+#reorder so up are on one side and down are on the other
+voom_counts_DEGs_clusters_long$cluster_id <- factor(voom_counts_DEGs_clusters_long$cluster_id, levels = c("Cluster 1", "Cluster 6", 
+                                                                                                          "Cluster 2", "Cluster 3", 
+                                                                                                          "Cluster 7", "Cluster 5", 
+                                                                                                          "Cluster 4"))
+
+#subsample and select up and down clusters
+voom_counts_DEGs_clusters_long_sub <- dplyr::sample_frac(voom_counts_DEGs_clusters_long, 0.1)
+
+voom_counts_DEGs_clusters_long_sub_up <- dplyr::filter(voom_counts_DEGs_clusters_long_sub, cluster_id %in% c("Cluster 1", "Cluster 2", "Cluster 7", "Cluster 4"))
+voom_counts_DEGs_clusters_long_sub_down <- dplyr::filter(voom_counts_DEGs_clusters_long_sub, cluster_id %in% c("Cluster 6", "Cluster 3", "Cluster 5"))
+```
+
+Plot
+```{r, fig.height=14, fig.width=4}
+plot_smooth_counts_clust_up <- ggplot(voom_counts_DEGs_clusters_long_sub_up, aes(x = Timepoint_hr, y=voom_cts, color = Infection)) +
+  geom_smooth(method = "loess", formula = y ~ x, lwd = 1, alpha = 0.3) +
+  facet_wrap(~cluster_id, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = c("grey", "#DB0000")) +
+  scale_y_continuous(breaks = seq(-7,7,1)) +
+  scale_x_continuous(breaks = seq(0,40,5)) +
+  labs(title = "Expression of kmeans clusters over time", 
+       x = "Time After Infection (hr)", y = "Voom Transformed Counts",
+       subtitle = "*only a random 10% subsample is shown for each") +
+  theme_minimal() +
+  theme(legend.position = "bottom", title = element_text(size = 8, face = "bold"), 
+        plot.title = element_text(hjust = 0.5), 
+        plot.subtitle = element_text(hjust = 0.5))
+
+plot_smooth_counts_clust_up
+```
+
+
+```{r, fig.height=11, fig.width=4}
+plot_smooth_counts_clust_down <- ggplot(voom_counts_DEGs_clusters_long_sub_down, aes(x = Timepoint_hr, y=voom_cts, color = Infection)) +
+  geom_smooth(method = "loess", formula = y ~ x, lwd = 1, alpha = 0.3) +
+  facet_wrap(~cluster_id, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = c("grey", "#0061C6")) +
+  scale_y_continuous(breaks = seq(-7,7,1)) +
+  scale_x_continuous(breaks = seq(0,40,5)) +
+  labs(title = "Expression of kmeans clusters over time", 
+       x = "Time After Infection (hr)", y = "Voom Transformed Counts",
+       subtitle = "*only a random 10% subsample is shown for each") +
+  theme_minimal() +
+  theme(legend.position = "bottom", title = element_text(size = 8, face = "bold"), 
+        plot.title = element_text(hjust = 0.5), 
+        plot.subtitle = element_text(hjust = 0.5))
+
+plot_smooth_counts_clust_down
+```
+
+
+The counts validate the cluster behavior. The NI counts over time emphasize the advantage of a timepoint-matched approach. 
+
+#### What pathways are specific to these clusters?
+Pathway enrichment analysis. Use the expressed genes as the universe to identify unique pathways among each. 
+
+```{r}
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(ReactomePA))
+suppressPackageStartupMessages(library(org.Hs.eg.db))
+
+#get genes from each cluster
+genes <- select(mashed_betas_degs_MC_clust, gene_id, Cluster_7) %>%
+  mutate(ensembl = str_split(gene_id, "_", simplify = T)[,1])
+
+#get entrez_ids
+ids <- bitr(genes$ensembl, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+
+#join
+genes <- left_join(genes, ids, by = c("ensembl" = "ENSEMBL"))
+```
+
+Get expressed genes
+```{r}
+#Read in genes
+expr_genes <- readRDS('data/filtered_counts.rds') %>% row.names() %>% as.data.frame()
+colnames(expr_genes) <- "gene_id"
+
+#get ensembl
+expr_genes <- mutate(expr_genes, ensembl = str_split(gene_id, "_", simplify = T)[,1])
+
+#get entrez
+expr_ids <- bitr(expr_genes$ensembl, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+
+#join
+expr_genes <- left_join(expr_genes, ids, by = c("ensembl" = "ENSEMBL"))
+
+#assign
+universe <- expr_genes$ENTREZID
+```
+
+
+Subset by cluster
+```{r}
+cluster_1 <- dplyr::filter(genes, Cluster_7== 1)$ENTREZID
+cluster_2 <- dplyr::filter(genes, Cluster_7 == 2)$ENTREZID
+cluster_3 <- dplyr::filter(genes, Cluster_7 == 3)$ENTREZID
+cluster_4 <- dplyr::filter(genes, Cluster_7 == 4)$ENTREZID
+cluster_5 <- dplyr::filter(genes, Cluster_7 == 5)$ENTREZID
+cluster_6 <- dplyr::filter(genes, Cluster_7 == 6)$ENTREZID
+cluster_7 <- dplyr::filter(genes, Cluster_7 == 7)$ENTREZID
+```
+
+Since I have the info, save the genes within each cluster for ancestry analysis: 
+```{r}
+dplyr::filter(genes, Cluster_7== 1)$gene_id %>% saveRDS(file = "results/DEGs_cluster_1.RDS")
+dplyr::filter(genes, Cluster_7 == 2)$gene_id %>% saveRDS(file = "results/DEGs_cluster_2.RDS")
+dplyr::filter(genes, Cluster_7 == 3)$gene_id %>% saveRDS(file = "results/DEGs_cluster_3.RDS")
+dplyr::filter(genes, Cluster_7 == 4)$gene_id %>% saveRDS(file = "results/DEGs_cluster_4.RDS")
+dplyr::filter(genes, Cluster_7 == 5)$gene_id %>% saveRDS(file = "results/DEGs_cluster_5.RDS")
+dplyr::filter(genes, Cluster_7 == 6)$gene_id %>% saveRDS(file = "results/DEGs_cluster_6.RDS")
+dplyr::filter(genes, Cluster_7 == 7)$gene_id %>% saveRDS(file = "results/DEGs_cluster_7.RDS")
+```
+
+Run analysis for up and down clusters seperately and order by which turn on fastest
+```{r}
+up_clusters <- list("cluster 1" = cluster_1, 
+                 "cluster 2" = cluster_2,
+                 "cluster 7" = cluster_7,
+                 "cluster 4" = cluster_4)
+
+down_clusters <- list("cluster 6" = cluster_6, 
+                 "cluster 3" = cluster_3,
+                 "cluster 5" = cluster_5)
+
+up_reactome <- clusterProfiler::compareCluster(geneClusters = up_clusters, fun = enrichPathway, universe = universe)
+up_kegg <- clusterProfiler::compareCluster(geneClusters = up_clusters, fun = enrichKEGG, universe = universe)
+up_bp <- clusterProfiler::compareCluster(geneClusters = up_clusters, fun = enrichGO, universe = universe, OrgDb = org.Hs.eg.db, ont = "BP", keyType = "ENTREZID")
+
+down_reactome <- clusterProfiler::compareCluster(geneClusters = down_clusters, fun = enrichPathway, universe = universe)
+down_kegg <- clusterProfiler::compareCluster(geneClusters = down_clusters, fun = enrichKEGG, universe = universe)
+down_bp <- clusterProfiler::compareCluster(geneClusters = down_clusters, fun = enrichGO, universe = universe, OrgDb = org.Hs.eg.db, ont = "BP", keyType = "ENTREZID")
+```
+
+Plot
+```{r, fig.height=6, fig.width=8}
+plot_up_reactome <- dotplot(up_reactome, showCategory = 5) + ggtitle("Reactome Pathway Enrichment for Upregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_up_kegg <- dotplot(up_kegg, showCategory = 5) + ggtitle("KEGG Pathway Enrichment for Upregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_up_bp <- dotplot(up_bp, showCategory = 5) + ggtitle('Gene Onology Enrichment for Upregulated Clusters vs. DEGs', subtitle = "Biological Process Terms" ) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+
+plot_down_reactome <- dotplot(down_reactome, showCategory = 5) + ggtitle("Reactome Pathway Enrichment for Downregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_down_kegg <- dotplot(down_kegg, showCategory = 5) + ggtitle("KEGG Pathway Enrichment for Downregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_down_bp <- dotplot(down_bp, showCategory = 5) + ggtitle('Gene Onology Enrichment for Downregulated Clusters vs. DEGs', subtitle = "Biological Process Terms" ) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+
+
+plot_up_reactome
+plot_up_kegg
+plot_up_bp
+
+plot_down_reactome
+plot_down_kegg
+plot_down_bp
+```
+
+It is not as clean as I would like. I will now repeat but use the whole protein coding genome as the universe. 
+```{r}
+#get entrez_ids for pc_genes
+pc_ids <- bitr(pc_gene_ids$gene_id, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+```
+```{r}
+#set universe to all protein coding genes
+universe <- pc_ids$ENTREZID
+```
+
+Run analysis
+```{r}
+up_reactome <- clusterProfiler::compareCluster(geneClusters = up_clusters, fun = enrichPathway, universe = universe)
+up_kegg <- clusterProfiler::compareCluster(geneClusters = up_clusters, fun = enrichKEGG, universe = universe)
+up_bp <- clusterProfiler::compareCluster(geneClusters = up_clusters, fun = enrichGO, universe = universe, OrgDb = org.Hs.eg.db, ont = "BP", keyType = "ENTREZID")
+
+down_reactome <- clusterProfiler::compareCluster(geneClusters = down_clusters, fun = enrichPathway, universe = universe)
+down_kegg <- clusterProfiler::compareCluster(geneClusters = down_clusters, fun = enrichKEGG, universe = universe)
+down_bp <- clusterProfiler::compareCluster(geneClusters = down_clusters, fun = enrichGO, universe = universe, OrgDb = org.Hs.eg.db, ont = "BP", keyType = "ENTREZID")
+```
+
+Plot
+```{r, fig.height=6, fig.width=8}
+plot_up_reactome <- dotplot(up_reactome, showCategory = 5) + ggtitle("Reactome Pathway Enrichment for Upregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_up_kegg <- dotplot(up_kegg, showCategory = 5) + ggtitle("KEGG Pathway Enrichment for Upregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_up_bp <- dotplot(up_bp, showCategory = 5) + ggtitle('Gene Onology Enrichment for Upregulated Clusters vs. DEGs', subtitle = "Biological Process Terms" ) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+
+plot_down_reactome <- dotplot(down_reactome, showCategory = 5) + ggtitle("Reactome Pathway Enrichment for Downregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_down_kegg <- dotplot(down_kegg, showCategory = 5) + ggtitle("KEGG Pathway Enrichment for Downregulated Clusters vs. DEGs")+
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+plot_down_bp <- dotplot(down_bp, showCategory = 5) + ggtitle('Gene Onology Enrichment for Downregulated Clusters vs. DEGs', subtitle = "Biological Process Terms" ) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50))
+
+
+plot_up_reactome
+plot_up_kegg
+plot_up_bp
+
+plot_down_reactome
+plot_down_kegg
+plot_down_bp
+```
+
+So far it seems like we are able to identify 7 patterns and these represent distinct functions of the immune response. 
+
+It seems like cluster 1, the rebound cluster is the initial response as it yields TLR4 pathways. 
+
+Cluster 2 is a small response and contains genes involved in the inital response as well as the secondary response. Temporally it is a little faster than cluster 7, but somewhat slower than cluster 1. I'm not sure what to make of cluster 2, it seems to be one of the less important clusters.
+
+Cluster 7 is the robust transcriptional response and is secondary to the response in cluster 1. This seems to be among the most functionally important clusters to me. 
+
+Cluster 4 seems to be the tertiary response and contains genes for ECM related pathways, such as collagen growth.
+
+For the down regulated clusters, cluster 6 is the inital response and is hihgly specific to the RHO, RAC1, and CDC42 GTPase patthways. This is very cool because phagocytosis involves these pathways and it would make sense that the bacteria is trying to inhibit phagocytosis. This seems like a critically important cluster as well. 
+
+Cluster 3 are genes that are rapidly downregulated but persist and they are cell cycle factors. Very unsure of how to interpret these other than maybe the infection tells the cell to stop cycling. These iPSC-MFs do cycle and the analysis we have says they do. The cell cycle analysis also says that they cycle slower after infection.  
+
+Cluster 5 are anti-viral genes. It seems like maybe the cells commit to antibacterial pathways and therefore turn off antiviral ones. This makes sense, but I need to do more research to see if this is true. This is a later response. 
+
+
+
+
+## Save relevant plots
+```{r, eval = FALSE}
+ggsave(plot = all_gsea_plot, filename = "results/plots_infection_vs_time/global_gsea.pdf", device = cairo_pdf, height = 8, width = 10)
+ggsave(plot = mf_regs_plot, filename = "results/plots_infection_vs_time/macrophage_genes_expr-vs-time.pdf", device = cairo_pdf, height = 20, width = 8)
+ggsave(plot = cell_cycle_plot, filename = "results/plots_infection_vs_time/cell-cycle_genes_expr-vs-time.pdf", device = cairo_pdf, height = 20, width = 8)
+ggsave(plot = degs_plot_mash, filename = "results/plots_infection_vs_time/number_degs_per_timepoint_mash.pdf", device = cairo_pdf, height = 5, width = 8)
+ggsave(plot = gsea_heatmap, filename = "results/plots_infection_vs_time/gsea_per_timepoint.pdf", device = cairo_pdf, height = 8, width = 7.5)
+ggsave(plot = elbow, filename = "results/plots_infection_vs_time/elbow_plot.pdf", device = cairo_pdf, height = 5, width = 8)
+ggsave(plot = clusters_plot, filename = "results/plots_infection_vs_time/cluster_behavior.pdf", device = cairo_pdf, height = 14, width = 8)
+ggsave(plot = plot_up_reactome, filename = "results/plots_infection_vs_time/cluster_reactome_up_all-pc-genes.pdf", device = cairo_pdf, height = 6, width = 8)
+ggsave(plot = plot_down_reactome, filename = "results/plots_infection_vs_time/cluster_reactome_up_down-pc-genes.pdf", device = cairo_pdf, height = 6, width = 8)
+ggsave(plot = plot_smooth_counts_clust_up, filename = "results/plots_infection_vs_time/clusters_counts_smooth_up.pdf", device = cairo_pdf, height = 14, width = 4)
+ggsave(plot = plot_smooth_counts_clust_down, filename = "results/plots_infection_vs_time/clusters_counts_smooth_down.pdf", device = cairo_pdf, height = 11, width = 4)
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

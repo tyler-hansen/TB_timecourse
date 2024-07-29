@@ -1,0 +1,181 @@
+---
+title: "Formatting Counts for TPS"
+author: "Tyler Hansen"
+date: "02.21.2024"
+output:
+  html_document:
+    df_print: paged
+---
+
+We want to modify the filtered counts to be usable by the TPS program. It requires data formatted as a csv, where gene is the first column, timepoint 1 value is second, and so on. Row 1 is the column names for the timepoints. 
+
+Further, we will average counts for each timepoint across individuals for Mtb only. 
+
+We will use voom tramsformed counts for this. 
+
+Only use run1 samples. 
+
+We will only use the 3,750 response genes. 
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+suppressPackageStartupMessages(library(GenomicFeatures))
+library(GenomicRanges)
+library(rtracklayer)
+suppressPackageStartupMessages(library(plyranges))
+```
+
+
+1. cts
+```{r}
+#read in cts
+cts_all <- read_tsv("data/kallisto.gene-level.lengthScaledTPM.tsv", show_col_types = F)
+```
+
+2. metadata
+```{r}
+#read in metadata
+sample_info_all <- read_tsv("results/metadata_with-covariates.tsv", col_names = T, show_col_types = F) %>% column_to_rownames("filename")
+
+#reorder timepoint levels:
+sample_info_all$Timepoint <- factor(sample_info_all$Timepoint, levels = c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48"))
+
+#convert flow_cell to factor:
+sample_info_all$Infection <- factor(sample_info_all$Infection, levels = c("NI","Mtb"))
+
+#filter for run1 samples
+sample_info_run1 <- dplyr::filter(sample_info_all, Run == "run1")
+
+#convert flow_cell to factor:
+sample_info_run1$flow_cell <- factor(sample_info_run1$flow_cell)
+```
+
+3. genes
+```{r}
+#read in GTF
+gtf_file <- "data/Homo_sapiens.GRCh38.87.gtf"
+gtf <- readGFFAsGRanges(gtf_file)
+```
+
+4. design
+```{r}
+#set design matrix
+design <- model.matrix(~ 0 + Infection + Donor_ID + perc_GC + perc_Dups + perc_Aligned + flow_cell, data = sample_info_run1)
+```
+
+5. filter counts
+```{r}
+#extract pc genes
+pc_gene_ids <- plyranges::filter(gtf, type == 'gene', gene_biotype == 'protein_coding') %>% as.data.frame() %>% dplyr::select(gene_id, gene_name)
+cts_1_all <- left_join(pc_gene_ids, cts_all, by = 'gene_id')
+cts_1_all <- unite(cts_1_all, "ID", gene_id:gene_name, sep = "_") %>% column_to_rownames(var = "ID")
+
+#remove bad samples and run1 only
+cts_2_all <- dplyr::select(cts_1_all, intersect(colnames(cts_1_all), row.names(sample_info_run1))) 
+
+#extract response genes
+degs <- readRDS("results/infection-only_DEGs_global+timepoint.rds")
+cts_3_all <- cts_2_all[degs$gene_id,]
+```
+
+6. voom transform
+```{r}
+dge_all <- DGEList(cts_3_all)
+dge_all <- calcNormFactors(dge_all)
+v_all <- voom(dge_all, design, plot = F)
+```
+
+7. extract voom counts
+```{r}
+df_voom_cts <- as.data.frame(v_all$E)
+```
+
+## Average across individuals (for Mtb only)
+
+Do not do for AF193 or EU144 as their T14 and T0 timepoints, repectively, are missing. 
+```{r}
+si_Mtb <- dplyr::filter(sample_info_run1, Donor_ID != "AF193")
+si_Mtb <- dplyr::filter(si_Mtb, Donor_ID != "EU144")
+```
+
+Prepare new si dfs
+```{r}
+#subset by infection
+si_Mtb <- dplyr::filter(si_Mtb, Infection == "Mtb" | (Timepoint == "T0" & Infection == "NI"))
+```
+
+```{r}
+cts_Mtb <- dplyr::select(df_voom_cts, intersect(colnames(cts_3_all), rownames(si_Mtb)))
+```
+
+```{r}
+cts_Mtb <- t(cts_Mtb) 
+cts_Mtb <- base::merge(si_Mtb, cts_Mtb, by = 'row.names')
+```
+
+```{r}
+for (t in c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9","T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")) {
+  tmp <- dplyr::filter(cts_Mtb, Timepoint == t) %>% column_to_rownames("Row.names") %>% select(19:last_col()) %>% t() %>% as.data.frame() %>% transmute(mean_cts = rowMeans(.))
+  colnames(tmp) <- paste0("mean_", t)
+  assign(x =paste0("cts_", t),  value = tmp)
+  rm(tmp)
+}
+```
+
+```{r}
+mean_cts_Mtb <- bind_cols(cts_T0, cts_T1, cts_T2, cts_T3, cts_T4, cts_T5, cts_T6, cts_T7, cts_T8, cts_T9, cts_T10, cts_T12, cts_T14, cts_T16, cts_T18, cts_T24, cts_T30, cts_T36, cts_T42, cts_T48)
+```
+
+```{r}
+vec <- data.frame(timepoints = c(0,1,2,3,4,5,6,7,8,9,10,12,14,16,18,24,30,36,42,48
+                                 )) %>% t() %>% as.data.frame()
+colnames(vec) <- c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9","T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")
+write_csv(vec, file = "results/TPS_cts/mean_cts_Mtb.txt", col_names = F)
+
+mean_cts_Mtb <- rownames_to_column(mean_cts_Mtb, ".")
+write_csv(mean_cts_Mtb, file = "results/TPS_cts/mean_cts_Mtb.txt", col_names = F, append = T)
+```
+
+
+## Make for each individual (for Mtb only)
+
+Do not do for AF193 or EU144 as their T14 and T0 timepoints, repectively, are missing. 
+```{r}
+si_Mtb <- dplyr::filter(sample_info_run1, Donor_ID != "AF193")
+si_Mtb <- dplyr::filter(si_Mtb, Donor_ID != "EU144")
+```
+
+Prepare new si dfs
+```{r}
+#subset by infection
+si_Mtb <- dplyr::filter(si_Mtb, Infection == "Mtb" | (Timepoint == "T0" & Infection == "NI"))
+```
+
+```{r}
+#for each donor, make a new si
+for (donor in unique(si_Mtb$Donor_ID)) {
+  assign(paste0("si_Mtb_", donor), value = dplyr::filter(si_Mtb, Donor_ID == donor))
+}
+```
+
+```{r}
+for (donor in unique(si_Mtb$Donor_ID)) {
+  si <- get(paste0("si_Mtb_", donor))
+  tmp <- dplyr::select(df_voom_cts, intersect(colnames(cts_3_all), rownames(si)))
+  colnames(tmp) <- get(paste0("si_Mtb_", donor))$Timepoint
+  tmp <- dplyr::select(tmp, T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T12,T14,T16,T18,T24,T30,T36,T42,T48)
+  assign(x = paste0("cts_Mtb_", donor), value = tmp)
+  vec <- data.frame(timepoints = c(0,1,2,3,4,5,6,7,8,9,10,12,14,16,18,24,30,36,42,48)) %>% t() %>% as.data.frame()
+  colnames(vec) <- c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9","T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")
+  write_csv(vec, file = paste0("results/TPS_cts/cts_Mtb_", donor, ".txt"), col_names = F)
+  tmp <- rownames_to_column(tmp, ".")
+  write_csv(tmp, file = paste0("results/TPS_cts/cts_Mtb_", donor, ".txt"), col_names = F, append = T)
+  rm(tmp)
+  rm(vec)
+}
+```

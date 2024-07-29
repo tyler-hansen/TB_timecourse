@@ -1,0 +1,2445 @@
+---
+title: "Linear modeling of RNA-seq data with Limma-Voom: Ancestry vs. Infection"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 3.12.2024
+
+I previously modeled the infection effect at each timepoint to understand how gene expression changes over time in response to Mtb infection. Now I want to identify how European/African ancestry impacts this response. To do this, I plan to do three different types of analysis. 
+
+1. PCA and UMAP of conditions with point color representing self reported ancestry. For this, I will do at three levels:
+  -All DEGs (any gene identified in any timepoint)
+  -Within time-series clusters
+  -Per timepoint
+  
+2. Population-specific DEs at each timepoint using all expressed genes as input. 
+  -Nested model: ~ 0 + Timepoint:African_admixture + Timepoint + technical confounders (including sex)
+  
+3. Population-specific DRs at each timepoint using all expressed genes as input. 
+  -Nested model for each timepoint: ~ 0 + (infection*African_admixture):time_point_hr + individual + time_point_hr*African_admixture +  technical confounders (including sex)
+  
+* For both 2 and 3, the follow-up analyses will be the following: 
+  - Line/point plot of number of popDEs and popDRs over time. 
+  - GSEA (using t stat from limma) to recreate figure 2d from Katie's paper. 
+  - Overlap of infection effect genes and ancestry genes (venn diagrams).
+  
+Analyses done here will likely make up figure 2. 
+
+## Analysis 1: PCA of DEGs by ancestry
+
+Load Libraries
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+```
+
+Read in counts and metadata
+```{r}
+#read in cts
+cts <- readRDS(file = "data/filtered_counts.rds")
+
+#read in sample info/metadata and sort alphabetically by filename
+sample_info <- read_tsv("results/metadata_filtered-samples_with-covariates.tsv", col_names = T, show_col_types = F) %>% column_to_rownames("filename")
+
+#convert flow_cell to factor:
+sample_info$flow_cell <- factor(sample_info$flow_cell)
+
+#reorder timepoint levels:
+sample_info$Timepoint <- factor(sample_info$Timepoint, levels = c("T1","T3","T5","T8","T12","T18","T24","T30","T36"))
+
+#convert flow_cell to factor:
+sample_info$Infection <- factor(sample_info$Infection, levels = c("NI","Mtb"))
+
+#Remove from metadata/sample_info so when intersecting in the filter step, it is removed from the counts as well. 
+sample_info <- dplyr::filter(sample_info, !(Run %in% c("run2") & Donor_ID == "AF69"))
+sample_info <- sample_info[rownames(sample_info) != "kallisto_4_AF69_T4_NI_run1", ]
+```
+
+Voom transform counts
+```{r}
+#set a design
+design <- model.matrix( ~ 0 + Timepoint:Infection + Timepoint + Donor_ID + perc_GC + perc_Dups + perc_Aligned + flow_cell, data = sample_info)
+
+#if match, then this will print true
+all(rownames(design) == colnames(cts))
+
+#make dgelist again and voom transform
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+v <- voom(dge, design, plot = T)
+```
+
+Load in DEGs
+```{r}
+all_DEGs <- readRDS("results/timepoint_specific_all_DEGs.RDS")
+
+T1_DEGs <- readRDS("results/timepoint_specific_T1_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+T3_DEGs <- readRDS("results/timepoint_specific_T3_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+T5_DEGs <- readRDS("results/timepoint_specific_T5_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+T8_DEGs <- readRDS("results/timepoint_specific_T8_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id) 
+T12_DEGs <- readRDS("results/timepoint_specific_T12_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+T18_DEGs <- readRDS("results/timepoint_specific_T18_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+T24_DEGs <- readRDS("results/timepoint_specific_T24_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+T30_DEGs <- readRDS("results/timepoint_specific_T30_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+T36_DEGs <- readRDS("results/timepoint_specific_T36_DEGs.RDS") %>% as.data.frame() %>% dplyr::select(gene_id)
+
+cluster1_DEGs <- readRDS("results/DEGs_cluster_1.RDS") %>% as.data.frame()
+cluster2_DEGs <- readRDS("results/DEGs_cluster_2.RDS") %>% as.data.frame()
+cluster3_DEGs <- readRDS("results/DEGs_cluster_3.RDS") %>% as.data.frame()
+cluster4_DEGs <- readRDS("results/DEGs_cluster_4.RDS") %>% as.data.frame()
+cluster5_DEGs <- readRDS("results/DEGs_cluster_5.RDS") %>% as.data.frame()
+cluster6_DEGs <- readRDS("results/DEGs_cluster_6.RDS") %>% as.data.frame()
+cluster7_DEGs <- readRDS("results/DEGs_cluster_7.RDS") %>% as.data.frame()
+```
+
+### Level 1: All DEGs
+
+Remove batch effects and covariates
+```{r}
+design_batch_removed <- model.matrix( ~ 0 + Timepoint:Infection + Timepoint + Donor_ID, data = sample_info)
+all(colnames(v$E) == rownames(sample_info))
+v_batchRemoved <- removeBatchEffect(v, batch = sample_info$flow_cell, covariates = sample_info[,9:11], design = design_batch_removed)
+```
+
+Intersect with all DEGs
+```{r}
+voom_counts <- as.data.frame(v_batchRemoved) %>% rownames_to_column("gene_id")
+voom_counts_all_DEGs <- inner_join(voom_counts, all_DEGs, by = "gene_id")
+```
+
+Calculate PCAs
+```{r}
+voom_counts_all_DEGs <- column_to_rownames(voom_counts_all_DEGs, "gene_id")
+mat <- as.matrix(voom_counts_all_DEGs) %>% t()
+pcamat <- prcomp(mat)
+```
+
+Plot variance explained by top 20 PCAs
+```{r}
+#variance explained by PCs
+pc_eigenvalues <- pcamat$sdev^2
+
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), 
+                         variance = pc_eigenvalues) %>%
+  mutate(pct = variance/sum(variance)*100) %>%
+  mutate(pct_cum = cumsum(pct))
+
+pc_eigenvalues %>% 
+  ggplot(aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + coord_cartesian(xlim = c(0,20))
+```
+
+PC1 and PC2 explains a lot, but it looks like PCs1-5 contribute as well.  
+
+Plot PC1 and PC2 and use color/point type for variables
+```{r, fig.dim=c(9,5)}
+#Prepare tibble for plotting
+pc_scores <- as_tibble(pcamat$x, rownames = "filename")
+
+#add metadata
+metadata <- rownames_to_column(sample_info, var = "filename")
+pc_scores <- left_join(pc_scores, metadata, by = "filename")
+
+#relevel infection:
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Try UMAP with top 35 PCs
+```{r}
+umap <- umap::umap(pcamat$x[, 1:35])
+
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+
+#add metadata
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+
+#relevel infection:
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+### Level 2: Clusters
+
+Intersect batch corrected counts with clusters
+```{r}
+voom_counts_cluster1 <- inner_join(voom_counts, cluster1_DEGs, by = c("gene_id" = ".")) %>% distinct()
+voom_counts_cluster2 <- inner_join(voom_counts, cluster2_DEGs, by = c("gene_id" = ".")) %>% distinct()
+voom_counts_cluster3 <- inner_join(voom_counts, cluster3_DEGs, by = c("gene_id" = ".")) %>% distinct()
+voom_counts_cluster4 <- inner_join(voom_counts, cluster4_DEGs, by = c("gene_id" = ".")) %>% distinct()
+voom_counts_cluster5 <- inner_join(voom_counts, cluster5_DEGs, by = c("gene_id" = ".")) %>% distinct()
+voom_counts_cluster6 <- inner_join(voom_counts, cluster6_DEGs, by = c("gene_id" = ".")) %>% distinct()
+voom_counts_cluster7 <- inner_join(voom_counts, cluster7_DEGs, by = c("gene_id" = ".")) %>% distinct()
+```
+
+Cluster 1
+```{r}
+#define cluster
+df = voom_counts_cluster1
+title = "Cluster 1"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Cluster 2
+```{r}
+#define cluster
+df = voom_counts_cluster2
+title = "Cluster 2"
+
+#compute
+pcamat <- distinct(df) %>% column_to_rownames("gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Cluster 3
+```{r}
+#define cluster
+df = voom_counts_cluster3
+title = "Cluster 3"
+
+#compute
+pcamat <- distinct(df) %>% column_to_rownames("gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Cluster 4
+```{r}
+#define cluster
+df = voom_counts_cluster4
+title = "Cluster 4"
+
+#compute
+pcamat <- distinct(df) %>% column_to_rownames("gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Cluster 5
+```{r}
+#define cluster
+df = voom_counts_cluster5
+title = "Cluster 5"
+
+#compute
+pcamat <- distinct(df) %>% column_to_rownames("gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Cluster 6
+```{r}
+#define cluster
+df = voom_counts_cluster6
+title = "Cluster 6"
+
+#compute
+pcamat <- distinct(df) %>% column_to_rownames("gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Cluster 7
+```{r}
+#define cluster
+df = voom_counts_cluster7
+title = "Cluster 7"
+
+#compute
+pcamat <- distinct(df) %>% column_to_rownames("gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+### Level 3: Timepoints
+
+Intersect batch corrected counts with timepoints
+```{r}
+voom_counts_T1 <- inner_join(voom_counts, T1_DEGs, by = "gene_id")
+voom_counts_T3 <- inner_join(voom_counts, T3_DEGs, by = "gene_id")
+voom_counts_T5 <- inner_join(voom_counts, T5_DEGs, by = "gene_id")
+voom_counts_T8 <- inner_join(voom_counts, T8_DEGs, by = "gene_id")
+voom_counts_T12 <- inner_join(voom_counts, T12_DEGs, by = "gene_id")
+voom_counts_T18 <- inner_join(voom_counts, T18_DEGs, by = "gene_id")
+voom_counts_T24 <- inner_join(voom_counts, T24_DEGs, by = "gene_id")
+voom_counts_T30 <- inner_join(voom_counts, T30_DEGs, by = "gene_id")
+voom_counts_T36 <- inner_join(voom_counts, T36_DEGs, by = "gene_id")
+```
+
+Timepoint - T1
+```{r}
+#define cluster
+df = voom_counts_T1
+title = "Timepoint - T1"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T3
+```{r}
+#define cluster
+df = voom_counts_T3
+title = "Timepoint - T3"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T5
+```{r}
+#define cluster
+df = voom_counts_T5
+title = "Timepoint - T5"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T8
+```{r}
+#define cluster
+df = voom_counts_T8
+title = "Timepoint - T8"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T12
+```{r}
+#define cluster
+df = voom_counts_T12
+title = "Timepoint - T12"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T18
+```{r}
+#define cluster
+df = voom_counts_T18
+title = "Timepoint - T18"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T24
+```{r}
+#define cluster
+df = voom_counts_T24
+title = "Timepoint - T24"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T30
+```{r}
+#define cluster
+df = voom_counts_T30
+title = "Timepoint - T30"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+Timepoint - T36
+```{r}
+#define cluster
+df = voom_counts_T36
+title = "Timepoint - T36"
+
+#compute
+pcamat <- column_to_rownames(df, "gene_id") %>% as.matrix() %>% t() %>% prcomp()
+pc_scores <- as_tibble(pcamat$x, rownames = "filename") %>% left_join(metadata, by = "filename")
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#plot PCs
+pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores %>% 
+  ggplot(aes(x = PC3, y = PC4, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+#compute UMAP
+umap <- umap::umap(pcamat$x[, 1:35])
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  ggtitle(title) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+```
+
+To me the most significant observation here is that the ancestries separate more and more over time. But the distinction is still not clear (like it was when Haley did it) at T36. 
+
+
+## Analysis 2: PopDEs at each timepoint 
+
+To do this, seperate each condition and then run look at ancestry effect per timepoint. 
+
+__Option A__
+I will first try including the confounders in the model, like this:
+~ 0 + Timepoint:African_admixture + Timepoint + batch + flow_cell + perc_GC + perc_Aligned + perc_Dups + sex
+
+__Option B__
+I will next try regressing out the confounders and then applying corrected expression to the model, like this:
+expr ~ 0 + batch + flow_cell + perc_GC + perc_Aligned + perc_Dups + sex + __residuals__
+__residuals__ ~ 0 + Timepoint:African_admixture + Timepoint 
+
+Load Libraries
+Packages
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+```
+
+Three tables
+```{r}
+#read in GTF
+gtf <- rtracklayer::readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+
+#read in SI
+sample_info <- readRDS("data/metadata_with-covariates_final_samples_withBatch.rds")
+
+#read in cts
+cts <- readRDS("data/filtered_counts_final_samples.rds")
+```
+
+Modify sample info - assign average admixture of each ethnicity to the NA values
+```{r}
+AA_average <- dplyr::filter(sample_info, self_reported_ethnicity == "AA")$African_admixture %>% mean(na.rm = T)
+EA_average <- dplyr::filter(sample_info, self_reported_ethnicity == "EA")$African_admixture %>% mean(na.rm = T)
+
+sample_info$African_admixture[is.na(sample_info$African_admixture)& sample_info$self_reported_ethnicity == "AA"] <- AA_average
+sample_info$African_admixture[is.na(sample_info$African_admixture)& sample_info$self_reported_ethnicity == "EA"] <- EA_average
+```
+
+Admixture distribution
+```{r}
+hist(sample_info$African_admixture, breaks = 100)
+```
+
+
+Subset sample info into NI and Mtb samples:
+```{r}
+sample_info_Mtb <- dplyr::filter(sample_info, Infection == "Mtb")
+sample_info_NI <- dplyr::filter(sample_info, Infection == "NI")
+```
+
+### Option A: Include everything in the model
+
+Set up design
+```{r}
+design_A_Mtb <- model.matrix(~ 0 + Timepoint:African_admixture + Timepoint + batch + flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info_Mtb)
+design_A_NI <- model.matrix(~ 0 + Timepoint:African_admixture + Timepoint + batch + flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info_NI)
+```
+
+Subset counts by infection by intersecting with new SI
+```{r}
+cts_Mtb <- cts[, row.names(sample_info_Mtb)]
+cts_NI <- cts[, row.names(sample_info_NI)]
+
+#if match, then this will print true
+all(rownames(design_A_Mtb) == colnames(cts_Mtb))
+all(rownames(design_A_NI) == colnames(cts_NI))
+```
+
+Voom transform counts
+```{r}
+dge_Mtb <- DGEList(cts_Mtb)
+dge_Mtb <- calcNormFactors(dge_Mtb)
+v_Mtb <- voom(dge_Mtb, design_A_Mtb, plot = T)
+
+dge_NI <- DGEList(cts_NI)
+dge_NI <- calcNormFactors(dge_NI)
+v_NI <- voom(dge_Mtb, design_A_NI, plot = T)
+```
+
+Fit and calc stats
+```{r}
+vfit_A_Mtb <- lmFit(v_Mtb, design_A_Mtb)
+vfit_A_NI <- lmFit(v_NI, design_A_NI)
+
+vfit_A_Mtb <- eBayes(vfit_A_Mtb)
+vfit_A_NI <- eBayes(vfit_A_NI)
+```
+
+```{r}
+#setup list to iterate through
+timepoint_list <- list("TimepointT1:African_admixture", "TimepointT3:African_admixture", "TimepointT5:African_admixture", "TimepointT8:African_admixture", "TimepointT12:African_admixture", 
+                       "TimepointT18:African_admixture", "TimepointT24:African_admixture", "TimepointT30:African_admixture", "TimepointT36:African_admixture", "TimepointT48:African_admixture")
+for (i in timepoint_list) {
+  print(i)
+  topTable(vfit_A_Mtb, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+  topTable(vfit_A_NI, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+}
+```
+
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48")), 
+                          Mtb = c(512, 1870, 1235, 63, 61, 22, 45, 92, 32, 25), 
+                          NI = c(150, 1, 0, 0, 0, 0, 0, 0, 0, 303)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+degs_plot <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 100) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Thresholds: FDR < 0.1") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+degs_plot
+```
+
+
+#### Look at batch 1/2 seperately
+Subset sample info into NI and Mtb samples:
+```{r}
+sample_info_Mtb_batch1 <- dplyr::filter(sample_info_Mtb, batch == "batch1")
+sample_info_Mtb_batch2 <- dplyr::filter(sample_info_Mtb, batch == "batch 2")
+
+sample_info_NI_batch1 <- dplyr::filter(sample_info_NI, batch == "batch1")
+sample_info_NI_batch2 <- dplyr::filter(sample_info_NI, batch == "batch 2")
+```
+
+### Option A: Include everything in the model
+
+Set up design
+```{r}
+design_A_Mtb_batch1 <- model.matrix(~ 0 + Timepoint:African_admixture + Timepoint + flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info_Mtb_batch1)
+design_A_Mtb_batch2 <- model.matrix(~ 0 + Timepoint:African_admixture + Timepoint + flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info_Mtb_batch2)
+
+design_A_NI_batch1 <- model.matrix(~ 0 + Timepoint:African_admixture + Timepoint + flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info_NI_batch1)
+design_A_NI_batch2 <- model.matrix(~ 0 + Timepoint:African_admixture + Timepoint + flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info_NI_batch2)
+```
+
+Subset counts by infection by intersecting with new SI
+```{r}
+cts_Mtb_batch1 <- cts[, row.names(sample_info_Mtb_batch1)]
+cts_Mtb_batch2 <- cts[, row.names(sample_info_Mtb_batch2)]
+
+cts_NI_batch1 <- cts[, row.names(sample_info_NI_batch1)]
+cts_NI_batch2 <- cts[, row.names(sample_info_NI_batch2)]
+```
+
+```{r}
+vfit_A_Mtb_batch1 <- DGEList(cts_Mtb_batch1) %>% calcNormFactors() %>% voom(design_A_Mtb_batch1) %>% lmFit(design_A_Mtb_batch1) %>% eBayes()
+vfit_A_Mtb_batch2 <- DGEList(cts_Mtb_batch2) %>% calcNormFactors() %>% voom(design_A_Mtb_batch2) %>% lmFit(design_A_Mtb_batch2) %>% eBayes()
+
+vfit_A_NI_batch1 <- DGEList(cts_NI_batch1) %>% calcNormFactors() %>% voom(design_A_NI_batch1) %>% lmFit(design_A_NI_batch1) %>% eBayes()
+vfit_A_NI_batch2 <- DGEList(cts_NI_batch2) %>% calcNormFactors() %>% voom(design_A_NI_batch2) %>% lmFit(design_A_NI_batch2) %>% eBayes()
+```
+```{r}
+#setup list to iterate through
+timepoint_list <- list("TimepointT1:African_admixture", "TimepointT3:African_admixture", "TimepointT5:African_admixture", "TimepointT8:African_admixture", "TimepointT12:African_admixture", 
+                       "TimepointT18:African_admixture", "TimepointT24:African_admixture", "TimepointT30:African_admixture", "TimepointT36:African_admixture", "TimepointT48:African_admixture")
+for (i in timepoint_list) {
+  print(i)
+  topTable(vfit_A_Mtb_batch1, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+  topTable(vfit_A_NI_batch1, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+}
+```
+
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48")), 
+                          Mtb = c(8, 59, 24, 13, 38, 0, 54, 3808, 20, 3603), 
+                          NI = c(317, 11, 11, 5, 8, 5, 3, 6, 71, 55)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 100) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Thresholds: FDR < 0.1") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+```
+
+```{r}
+#setup list to iterate through
+timepoint_list <- list("TimepointT1:African_admixture", "TimepointT3:African_admixture", "TimepointT5:African_admixture", "TimepointT8:African_admixture", "TimepointT12:African_admixture", 
+                       "TimepointT18:African_admixture", "TimepointT24:African_admixture", "TimepointT30:African_admixture", "TimepointT36:African_admixture", "TimepointT48:African_admixture")
+for (i in timepoint_list) {
+  print(i)
+  topTable(vfit_A_Mtb_batch2, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+  topTable(vfit_A_NI_batch2, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+}
+```
+
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48")), 
+                          Mtb = c(1674, 5073, 24, 13, 38, 0, 54, 3808, 20, 3603), 
+                          NI = c(317, 11, 11, 5, 8, 5, 3, 6, 71, 55)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 100) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Thresholds: FDR < 0.1") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+```
+
+
+
+
+
+
+
+
+
+```{r}
+#read in cts
+design <-  model.matrix(~0 + Run, data = sample_info)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+
+residuals <- residuals.MArrayLM(object = fit, v)
+length(v$E) == length(residuals)
+
+avg_batch_effect <- rowMeans(fit$coefficients)
+corrected_expression <- apply(residuals,2,function(x){x + avg_batch_effect})
+weights <- v$weights
+colnames(weights) <- colnames(corrected_expression)
+rownames(weights) <- rownames(corrected_expression)
+
+
+corrected_expression <- as.data.frame(corrected_expression)
+weights <- as.data.frame(weights)
+
+cts_Mtb <- dplyr::select(corrected_expression, intersect(colnames(corrected_expression), row.names(sample_info_Mtb))) %>% as.matrix()
+cts_NI <- dplyr::select(corrected_expression, intersect(colnames(corrected_expression), row.names(sample_info_NI))) %>% as.matrix()
+
+weights_Mtb <- dplyr::select(weights, intersect(colnames(weights), row.names(sample_info_Mtb))) %>% as.matrix()
+weights_NI <- dplyr::select(weights, intersect(colnames(weights), row.names(sample_info_NI))) %>% as.matrix()
+``vfit_Mtb <- lmFit(cts_Mtb, weights = weights_Mtb, design_Mtb, plot = F)
+vfit_NI <- lmFit(cts_NI, weights = weights_NI, design_Mtb, plot = F)`
+
+Voom transform counts
+```{r}
+design_Mtb <- model.matrix( ~ 0 + Timepoint:African_admixture + Timepoint + perc_GC + perc_Dups + perc_Aligned + Sex, data = sample_info_Mtb)
+design_NI <- model.matrix( ~ 0 + Timepoint:African_admixture + Timepoint + perc_GC + perc_Dups + perc_Aligned + Sex, data = sample_info_NI)
+
+#if match, then this will print true
+all(rownames(design_Mtb) == colnames(cts_Mtb))
+all(rownames(design_NI) == colnames(cts_NI))
+
+#make dgelist again and voom transform
+vfit_Mtb <- lmFit(cts_Mtb, weights = weights_Mtb, design_Mtb, plot = F)
+vfit_NI <- lmFit(cts_NI, weights = weights_NI, design_Mtb, plot = F)
+```
+
+### Fit model and compute empirical bayes statistics for contrasts
+```{r}
+#compute stats
+vfit_Mtb <- eBayes(vfit_Mtb)
+vfit_NI <- eBayes(vfit_NI)
+```
+
+### Plot residual variance vs. expression SA plot
+
+```{r}
+plotSA(vfit_Mtb)
+plotSA(vfit_NI)
+```
+
+```{r}
+#setup list to iterate through
+timepoint_list <- list("TimepointT1:African_admixture", "TimepointT3:African_admixture", "TimepointT5:African_admixture", "TimepointT8:African_admixture", "TimepointT12:African_admixture", 
+                       "TimepointT18:African_admixture", "TimepointT24:African_admixture", "TimepointT30:African_admixture", "TimepointT36:African_admixture", "TimepointT48:African_admixture")
+for (i in timepoint_list) {
+  print(i)
+  topTable(vfit_Mtb, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+  topTable(vfit_NI, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+}
+```
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48")), 
+                          Mtb = c(494, 1700, 865, 35, 25, 9, 21, 39, 14, 21), 
+                          NI = c(2860, 1198, 0, 0, 0, 18, 232, 190, 9, 1063)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+degs_plot <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 500) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Thresholds: FDR < 0.1") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+degs_plot
+```
+
+Voom transform counts - haley's way
+```{r}
+#set a design
+design <- model.matrix(~ 0 + (Infection + African_admixture:Infection):Timepoint + perc_GC + perc_Dups + perc_Aligned + Run + Sex, data = sample_info)
+
+#if match, then this will print true
+all(rownames(design) == colnames(cts))
+
+#make dgelist again and voom transform
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+v <- voom(dge, design, plot = T)
+```
+
+### Fit model and compute empirical bayes statistics for contrasts
+```{r}
+#fit model
+vfit <-lmFit(v, design)
+
+#compute stats
+vfit <- eBayes(vfit)
+```
+
+```{r}
+sample_info_Run1 <- dplyr::filter(sample_info, Run == "run1")
+sample_info_Run2 <- dplyr::filter(sample_info, Run == "run2")
+sample_info_MLS <- dplyr::filter(sample_info, db == "MLS")
+sample_info_Run2_MLS <- dplyr::filter(sample_info_Run2, db == "MLS")
+```
+
+Subset counts using new SI
+```{r}
+cts_Run1 <- dplyr::select(cts, intersect(colnames(cts), row.names(sample_info_Run1))) 
+cts_Run2 <- dplyr::select(cts, intersect(colnames(cts), row.names(sample_info_Run2)))
+cts_MLS <- dplyr::select(cts, intersect(colnames(cts), row.names(sample_info_MLS)))
+cts_Run2_MLS <- dplyr::select(cts, intersect(colnames(cts), row.names(sample_info_Run2_MLS)))
+```
+
+```{r}
+#set a design
+design_Run1 <- model.matrix(~ 0 + (Infection + African_admixture:Infection):Timepoint + perc_GC + perc_Dups + perc_Aligned, data = sample_info_Run1)
+
+#if match, then this will print true
+all(rownames(design_Run1) == colnames(cts_Run1))
+
+#make dgelist again and voom transform
+dge_Run1 <- DGEList(cts_Run1)
+dge_Run1 <- calcNormFactors(dge_Run1)
+v_Run1 <- voom(dge_Run1, design_Run1, plot = T)
+
+#set a design
+design_Run2 <- model.matrix(~ 0 + (Infection + African_admixture:Infection):Timepoint + perc_GC + perc_Dups + perc_Aligned, data = sample_info_Run2)
+
+#if match, then this will print true
+all(rownames(design_Run2) == colnames(cts_Run2))
+
+#make dgelist again and voom transform
+dge_Run2 <- DGEList(cts_Run2)
+dge_Run2 <- calcNormFactors(dge_Run2)
+v_Run2 <- voom(dge_Run2, design_Run2, plot = T)
+```
+```{r}
+#fit model
+vfit_Run1 <-lmFit(v_Run1, design_Run1)
+
+#compute stats
+vfit_Run1 <- eBayes(vfit_Run1)
+
+#fit model
+vfit_Run2 <-lmFit(v_Run2, design_Run2)
+
+#compute stats
+vfit_Run2 <- eBayes(vfit_Run2)
+```
+
+```{r}
+#setup list to iterate through
+timepoint_list <- list("InfectionNI:African_admixture:TimepointT1" , "InfectionMtb:African_admixture:TimepointT1" , "InfectionNI:African_admixture:TimepointT3" , "InfectionMtb:African_admixture:TimepointT3" , "InfectionNI:African_admixture:TimepointT5" , "InfectionMtb:African_admixture:TimepointT5" , "InfectionNI:African_admixture:TimepointT8" , "InfectionMtb:African_admixture:TimepointT8" , "InfectionNI:African_admixture:TimepointT12" , "InfectionMtb:African_admixture:TimepointT12" , "InfectionNI:African_admixture:TimepointT18" , "InfectionMtb:African_admixture:TimepointT18" , "InfectionNI:African_admixture:TimepointT24" , "InfectionMtb:African_admixture:TimepointT24" , "InfectionNI:African_admixture:TimepointT30" , "InfectionMtb:African_admixture:TimepointT30" , "InfectionNI:African_admixture:TimepointT36" , "InfectionMtb:African_admixture:TimepointT36")
+for (i in timepoint_list) {
+  print(i)
+  topTable(vfit_Run1, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+}
+```
+
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")), 
+                          Mtb = c(5, 133, 76, 20, 530, 843, 1695, 4440, 3457), 
+                          NI = c(13, 7, 5, 17, 6, 7, 4, 10, 93)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+degs_plot <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 500) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Run1 only") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+degs_plot
+```
+```{r}
+#setup list to iterate through
+timepoint_list <- list("InfectionNI:African_admixture:TimepointT1" , "InfectionMtb:African_admixture:TimepointT1" , "InfectionNI:African_admixture:TimepointT3" , "InfectionMtb:African_admixture:TimepointT3" , "InfectionNI:African_admixture:TimepointT5" , "InfectionMtb:African_admixture:TimepointT5" , "InfectionNI:African_admixture:TimepointT8" , "InfectionMtb:African_admixture:TimepointT8" , "InfectionNI:African_admixture:TimepointT12" , "InfectionMtb:African_admixture:TimepointT12" , "InfectionNI:African_admixture:TimepointT18" , "InfectionMtb:African_admixture:TimepointT18" , "InfectionNI:African_admixture:TimepointT24" , "InfectionMtb:African_admixture:TimepointT24" , "InfectionNI:African_admixture:TimepointT30" , "InfectionMtb:African_admixture:TimepointT30" , "InfectionNI:African_admixture:TimepointT36" , "InfectionMtb:African_admixture:TimepointT36")
+for (i in timepoint_list) {
+  print(i)
+  topTable(vfit_Run2, number = Inf, p.value = 0.1, coef = i) %>% nrow() %>% print()
+}
+```
+
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")), 
+                          Mtb = c(1770, 5213, 4670, 1588, 785, 515, 2306, 293, 1281), 
+                          NI = c(1746, 5043, 5144, 4228, 3844, 2375, 1917, 1124, 135)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+degs_plot <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 500) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("blue", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Run2 only") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+degs_plot
+```
+```{r}
+all_coef <- vfit$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+run1_coef <- vfit_Run1$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+cor.test(all_coef, run1_coef)
+
+plot(all_coef, run1_coef)
+
+
+all_coef <- vfit$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+run2_coef <- vfit_Run2$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+cor.test(all_coef, run2_coef)
+
+plot(all_coef, run2_coef)
+
+
+run1_coef <- vfit_Run1$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+run2_coef <- vfit_Run2$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+cor.test(run1_coef, run2_coef, method = "spearman")
+
+plot(run1_coef, run2_coef)
+
+
+MLS_coef <- vfit_MLS$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+cor.test(run1_coef, MLS_coef, method = "spearman")
+
+run2_MLS_coef <- vfit_Run2_MLS$p.value[, "InfectionMtb:African_admixture:TimepointT30"]
+cor.test(run1_coef, run2_MLS_coef, method = "spearman")
+
+plot(run1_coef, run2_MLS_coef)
+```
+
+```{r}
+all_res <- topTable(vfit, number = Inf, p.value = 0.1, coef = "InfectionMtb:African_admixture:TimepointT30")
+run1_res <- topTable(vfit_Run1, number = Inf, p.value = 0.1, coef = "InfectionMtb:African_admixture:TimepointT30")
+run2_res <- topTable(vfit_Run2, number = Inf, p.value = 0.1, coef = "InfectionMtb:African_admixture:TimepointT30")
+MLS_res <- topTable(vfit_MLS, number = Inf, p.value = 0.1, coef = "InfectionMtb:African_admixture:TimepointT30")
+run2_MLS_res <- topTable(vfit_Run2_MLS, number = Inf, p.value = 0.1, coef = "InfectionMtb:African_admixture:TimepointT30")
+common_res <- run1_res[row.names(all_res), ] %>% drop_na()
+
+nrow(all_res)
+nrow(run1_res)
+nrow(run2_res)
+nrow(MLS_res)
+nrow(run2_MLS_res)
+nrow(common_res)
+```
+
+
+
+
+### Verify model is working correctly by extracting top hits and plotting their voom transformed counts.
+
+```{r}
+#T30 - Mtb
+top <- v$E[row.names(topTable(vfit, number = 3, coef = "InfectionMtb:African_admixture:TimepointT30")), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T30" & Infection == "Mtb")
+
+# plot box plot of counts by time for each infection status
+ggplot(top, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+```{r}
+#T30 - NI
+top <- v$E[row.names(topTable(vfit, number = 3, coef = "InfectionNI:African_admixture:TimepointT30")), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T30" & Infection == "NI")
+
+# plot box plot of counts by time for each infection status
+ggplot(top, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+
+
+
+### Verify model is working correctly by extracting top hits and plotting their voom transformed counts. HERE!!
+
+```{r}
+#T1 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT1:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T1 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT1:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T3 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT3:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T3 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT3:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+```{r}
+#T5 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT5:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T5 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT5:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+```{r}
+#T8 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT8:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T8 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT8:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T12 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT12:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T12 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT12:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T18 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT18:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T18 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT18:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+```{r}
+#T24 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT24:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T24 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT24:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+```{r}
+#T30 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT30:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T30 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT30:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+```{r}
+#36 - Mtb
+res <- topTable(vfit_Mtb, number = 3, coef = "TimepointT36:African_admixture")
+top_v <- v_Mtb$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+```{r}
+#T36 - NI
+res <- topTable(vfit_NI, number = 3, coef = "TimepointT36:African_admixture")
+top_v <- v_NI$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T1")
+
+# plot box plot of counts by time for each infection status
+ggplot(top_v, aes(x = self_reported_ethnicity, y = voom_cts)) +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 0.5) +
+  geom_boxplot(aes(fill = self_reported_ethnicity), alpha = 0.5, outlier.alpha = 0) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  scale_fill_manual(values = c("steelblue", "orange")) +
+  scale_color_manual(values = c("steelblue", "orange")) +
+  theme_bw()
+```
+
+It looks like it is working properly for all timepoints, but there isn't as much difference as there was with timepoint. Which makes sense. 
+
+
+### Get empirical qvalues
+The q value adjustment for multiple testing correction seems to be the superior method to FWER and Benjamini-Hochberg. The only issue with it is when the pvalue distribution is not uniform. In most cases, this is fine, but it is best to use an empirical approach where the pvalues are first corrected based on null pvalues obtained from permutations. 
+
+To do this, we have the following steps:
+1. Permute the variable of interest and calculate the null pvalues, for at least 10 iterations.
+2. Adjust the observed pvalues based on the null/expected pvalues using the emPvals() function from the qvalue package. 
+3. Use the adjusted p values to calculate storey q values. Use these to threshold genes. 
+
+
+This is the same procedure as done for timepoint:infection effects. For this, we will permute admixture within timepoints. 
+
+#### Permute the variable of interest and calculate the null pvalues, for at least 10 iterations. 
+Permute the the admixture column within timepoint so that infection is random and the null is the random effect of that. 
+```{r}
+#function to permute the variable of interest
+permute_si_variable_within_category <- function(var, si, cat, n = 10) {
+  # var is the variable of interest
+  # si is the sample info/metadata
+  # cat is the category/variable to permute within (must be a factor)
+  # n is the number of iterations
+  # this function returns a list of permuted sample info data.frames 
+  
+  # create dummy list
+  list_x <- list()
+  
+  #split the si into the individual factors of the cat and permute var
+  for (category in levels(si[,cat])) {
+    #split si
+    x <- si[si[,cat] == category, ]
+    
+    #permute
+    x <- rsample::permutations(x, permute = all_of(var), times = n)
+    
+    #add to list
+    list_x[[category]] <- x
+  }
+
+  #for each iteration, extract permutations for each timepoint and join back together
+  
+  #make another dummy list
+  list_y <- list()
+  
+  for (i in seq(1, n)) {
+    #make dummy df 
+    df <- data.frame()
+    
+    for (category in levels(si[,cat])) {
+        x <- list_x[[category]] 
+        x <- x$splits[[i]] %>% rsample::analysis() %>% as.data.frame()
+        df <- rbind(df, x)
+    }
+    
+    #add df to list
+    list_y[[i]] <- df
+  }
+  #return the list
+  return(list_y)
+}
+```
+
+```{r}
+#execute function:
+permuted_si_Mtb_byAdmixture <- permute_si_variable_within_category(var = "African_admixture", si = sample_info_Mtb, cat = "Timepoint", n = 10)
+permuted_si_NI_byAdmixture <- permute_si_variable_within_category(var = "African_admixture", si = sample_info_NI, cat = "Timepoint", n = 10)
+```
+
+Fit permuted data to linear models, use the same model as done in the observed analysis
+```{r}
+fit_permutations <- function(perms, formula, v, w, n =  10) {
+  # perms is the permuted sample info
+  # formula is the formula used in the respective analysis provided in quotes (ex: "~ Timepoint")
+  # v are the voom tramsformed counts to input into the random/null models. 
+  # n is the number of iterations performed above. 
+  # Returns a list of model fits for the permuted data
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+    for (i in seq(1, n)) {
+      #set up model for ith iteration
+      m_rand <- model.matrix(as.formula(formula), data = as.data.frame(perms[i]))
+    
+      #fit model for each iteration
+      vfit_rand <- lmFit(v, weights = w, m_rand)
+      
+      #compute stats
+      vfit_rand <- eBayes(vfit_rand)
+      
+      #add to list
+      list_x <- rlist::list.append(list_x, vfit_rand)
+    }
+  return(list_x)
+}
+```
+
+```{r}
+permuted_fits_Mtb <- fit_permutations(perms = permuted_si_Mtb_byAdmixture, formula = "~ 0 + Timepoint:African_admixture + Timepoint + perc_GC + perc_Dups + perc_Aligned + Sex", v = cts_Mtb, w = weights_Mtb, n = 10)
+permuted_fits_NI <- fit_permutations(perms = permuted_si_NI_byAdmixture, formula = "~ 0 + Timepoint:African_admixture + Timepoint + perc_GC + perc_Dups + perc_Aligned + Sex", v = cts_NI, w = weights_NI, n = 10)
+```
+
+Calculate null pvalues
+```{r}
+get_null_pvals <- function(perm_fits, n =  10) {
+  # perm_fits is the list of model fits for permuted data
+  # n is the number of iterations performed above. 
+  # cat is the category/variable that was permuted within (must be a factor). This is used to identify the individual categories to get pvalues for. 
+  # Returns a vector of pvalues for the contrast between Mtb and NI
+  
+  # create dummy df
+  df <- data.frame()
+  
+  #for each iteration, extract the null pvalues between NI and Mtb:
+    for (i in seq(1, n)) {
+      #for each iteration, append p.vals to the dummy df
+      x <- as.data.frame(perm_fits[[i]]$p.value)
+      df <- dplyr::bind_rows(df, x)
+    }
+  return(df)
+}
+```
+
+```{r}
+null_pvalues_Mtb <- get_null_pvals(perm_fits = permuted_fits_Mtb, n = 10)
+null_pvalues_NI <- get_null_pvals(perm_fits = permuted_fits_NI, n = 10)
+```
+
+Check the distribution of null pvalues
+```{r}
+hist(as.matrix(null_pvalues_Mtb)[, 20:28])
+hist(vfit_Mtb$p.value[, 20:28])
+
+hist(as.matrix(null_pvalues_NI)[, 20:28])
+hist(vfit_NI$p.value[, 20:28])
+```
+
+qqplots
+```{r}
+for (i in seq(20,28,1)){
+  print(i)
+  qqplot(-log(as.matrix(null_pvalues_Mtb)[, i]), -log(vfit_Mtb$p.value[, i]))
+  abline(a=0,b=1,col='red')
+}
+
+```
+
+
+Eh, qqplots do not look great, there may not be much signal for some timepoints. 
+
+For each nested model, calculate p-values from a set of observed test statistics and simulated null test statistics. 
+
+```{r}
+#make pval and se dfs
+obs_pvals_Mtb <- as.data.frame(vfit_Mtb$p.value)
+obs_pvals_NI <- as.data.frame(vfit_NI$p.value)
+
+SE_Mtb <- sqrt(vfit_Mtb$s2.post) * vfit_Mtb$stdev.unscaled
+SE_NI <- sqrt(vfit_NI$s2.post) * vfit_NI$stdev.unscaled
+
+
+#setup list to iterate through
+timepoint_list <- list("TimepointT1:African_admixture", "TimepointT3:African_admixture", "TimepointT5:African_admixture", "TimepointT8:African_admixture", "TimepointT12:African_admixture", 
+                       "TimepointT18:African_admixture", "TimepointT24:African_admixture", "TimepointT30:African_admixture", "TimepointT36:African_admixture")
+
+#run through list to extract qvalues for each
+
+#Mtb first
+for (i in timepoint_list) {
+  emperical_pvals_Mtb <- qvalue::empPvals(stat = -log10(obs_pvals_Mtb[, i]), stat0 = -log10(null_pvalues_Mtb[, i]), pool = T)
+  qvals_Mtb <- qvalue::qvalue(p = emperical_pvals_Mtb)
+  
+  #merge
+  tmp1 <- data.frame(obs_pval = obs_pvals_Mtb[, i], empirical_qval = qvals_Mtb$qvalues)
+  
+  #get pvalues just for the timepoint
+  tmp2 <- dplyr::select(obs_pvals_Mtb, all_of(i))
+  colnames(tmp2) <- "p.value"
+  
+  #join to each gene
+  tmp3 <- bind_cols(tmp2, tmp1) %>% rownames_to_column("gene_id")
+  
+  #stop if the row order is not the same
+  if (all(tmp3$p.value == tmp3$obs_pval) == FALSE) {
+    stop()
+  }
+  
+  #remove redundant col
+  tmp3 <- dplyr::select(tmp3, -p.value)
+  
+  #get the stats
+  tmp4 <- data.frame(coefficients = c(vfit_Mtb$coefficients[, i]), 
+                     t_statistic = c(vfit_Mtb$t[, i]), 
+                     coef_se = c(SE_Mtb[, i]), 
+                     p.value = c(vfit_Mtb$p.value[, i])) %>% rownames_to_column("gene_id")
+  
+  #join
+  tmp5 <- inner_join(tmp4, tmp3, by = "gene_id")
+  
+  #stop if join doesn't work properly
+  if (all(tmp5$p.value == tmp5$obs_pval) == FALSE) {
+    stop()
+  }
+  #remove redundant col 
+  tmp5 <- dplyr::select(tmp5, -obs_pval)
+
+  #assign ttmp5
+  assign(value = tmp5, x = paste0(i, "_results_Mtb"))
+  
+  #remove tmps
+  rm(tmp1, tmp2, tmp3, tmp4, tmp5)
+}
+
+#NI next
+for (i in timepoint_list) {
+  emperical_pvals_NI <- qvalue::empPvals(stat = -log10(obs_pvals_NI[, i]), stat0 = -log10(null_pvalues_NI[, i]), pool = T)
+  qvals_NI <- qvalue::qvalue(p = emperical_pvals_NI)
+  
+  #merge
+  tmp1 <- data.frame(obs_pval = obs_pvals_NI[, i], empirical_qval = qvals_NI$qvalues)
+  
+  #get pvalues just for the timepoint
+  tmp2 <- dplyr::select(obs_pvals_NI, all_of(i))
+  colnames(tmp2) <- "p.value"
+  
+  #join to each gene
+  tmp3 <- bind_cols(tmp2, tmp1) %>% rownames_to_column("gene_id")
+  
+  #stop if the row order is not the same
+  if (all(tmp3$p.value == tmp3$obs_pval) == FALSE) {
+    stop()
+  }
+  
+  #remove redundant col
+  tmp3 <- dplyr::select(tmp3, -p.value)
+  
+  #get the stats
+  tmp4 <- data.frame(coefficients = c(vfit_NI$coefficients[, i]), 
+                     t_statistic = c(vfit_NI$t[, i]), 
+                     coef_se = c(SE_NI[, i]), 
+                     p.value = c(vfit_NI$p.value[, i])) %>% rownames_to_column("gene_id")
+  
+  #join
+  tmp5 <- inner_join(tmp4, tmp3, by = "gene_id")
+  
+  #stop if join doesn't work properly
+  if (all(tmp5$p.value == tmp5$obs_pval) == FALSE) {
+    stop()
+  }
+  #remove redundant col 
+  tmp5 <- dplyr::select(tmp5, -obs_pval)
+
+  #assign ttmp5
+  assign(value = tmp5, x = paste0(i, "_results_NI"))
+  
+  #remove tmps
+  rm(tmp1, tmp2, tmp3, tmp4, tmp5)
+}
+```
+
+### Number of popDEs per timepoint for each condition
+Report number of DEGs via qval
+```{r}
+dplyr::filter(`TimepointT1:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT3:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT5:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT8:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT12:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT18:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT24:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT30:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT36:African_admixture_results_Mtb`, empirical_qval < 0.05) %>% nrow()
+
+dplyr::filter(`TimepointT1:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT3:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT5:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT8:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT12:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT18:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT24:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT30:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+dplyr::filter(`TimepointT36:African_admixture_results_NI`, empirical_qval < 0.05) %>% nrow()
+```
+
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")), 
+                          Mtb = c(216, 2980, 538, 0, 35, 4, 0, 165, 0), 
+                          NI = c(1498, 6853, 3355, 3549, 2066, 201, 302, 9, 2)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+degs_plot <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 500) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Thresholds: emperical q-value < 0.01") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+degs_plot
+```
+
+This is different from what Haley saw. To me this doesn't make sense because NI popDEs should be constant over time. I will try using Mash next. 
+
+#### Mash betas and SE to get lfsr for DEG thresholdiing and to get better effect estimates
+
+Prepare matricies
+```{r}
+betas_mtb <- data.frame("T1" = `TimepointT1:African_admixture_results_Mtb`$coefficients, "T3" = `TimepointT3:African_admixture_results_Mtb`$coefficients, "T5" = `TimepointT5:African_admixture_results_Mtb`$coefficients,
+                    "T8" = `TimepointT8:African_admixture_results_Mtb`$coefficients, "T12" = `TimepointT12:African_admixture_results_Mtb`$coefficients, "T18" = `TimepointT18:African_admixture_results_Mtb`$coefficients,
+                    "T24" = `TimepointT24:African_admixture_results_Mtb`$coefficients, "T30" = `TimepointT30:African_admixture_results_Mtb`$coefficients, "T36" = `TimepointT36:African_admixture_results_Mtb`$coefficients, 
+                    row.names = `TimepointT1:African_admixture_results_Mtb`$gene_id) %>% as.matrix()
+
+standard_errors_mtb <- data.frame("T1" = `TimepointT1:African_admixture_results_Mtb`$coef_se, "T3" = `TimepointT3:African_admixture_results_Mtb`$coef_se, "T5" = `TimepointT5:African_admixture_results_Mtb`$coef_se,
+                    "T8" = `TimepointT8:African_admixture_results_Mtb`$coef_se, "T12" = `TimepointT12:African_admixture_results_Mtb`$coef_se, "T18" = `TimepointT18:African_admixture_results_Mtb`$coef_se,
+                    "T24" = `TimepointT24:African_admixture_results_Mtb`$coef_se, "T30" = `TimepointT30:African_admixture_results_Mtb`$coef_se, "T36" = `TimepointT36:African_admixture_results_Mtb`$coef_se, 
+                    row.names = `TimepointT1:African_admixture_results_Mtb`$gene_id) %>% as.matrix()
+
+betas_NI <- data.frame("T1" = `TimepointT1:African_admixture_results_NI`$coefficients, "T3" = `TimepointT3:African_admixture_results_NI`$coefficients, "T5" = `TimepointT5:African_admixture_results_NI`$coefficients,
+                    "T8" = `TimepointT8:African_admixture_results_NI`$coefficients, "T12" = `TimepointT12:African_admixture_results_NI`$coefficients, "T18" = `TimepointT18:African_admixture_results_NI`$coefficients,
+                    "T24" = `TimepointT24:African_admixture_results_NI`$coefficients, "T30" = `TimepointT30:African_admixture_results_NI`$coefficients, "T36" = `TimepointT36:African_admixture_results_NI`$coefficients, 
+                    row.names = `TimepointT1:African_admixture_results_NI`$gene_id) %>% as.matrix()
+
+standard_errors_NI <- data.frame("T1" = `TimepointT1:African_admixture_results_NI`$coef_se, "T3" = `TimepointT3:African_admixture_results_NI`$coef_se, "T5" = `TimepointT5:African_admixture_results_NI`$coef_se,
+                    "T8" = `TimepointT8:African_admixture_results_NI`$coef_se, "T12" = `TimepointT12:African_admixture_results_NI`$coef_se, "T18" = `TimepointT18:African_admixture_results_NI`$coef_se,
+                    "T24" = `TimepointT24:African_admixture_results_NI`$coef_se, "T30" = `TimepointT30:African_admixture_results_NI`$coef_se, "T36" = `TimepointT36:African_admixture_results_NI`$coef_se, 
+                    row.names = `TimepointT1:African_admixture_results_NI`$gene_id) %>% as.matrix()
+```
+
+Run mash
+1) Mtb
+```{r}
+library(mashr)
+
+## Step 1: Read in the data and account for correlations among measurements
+#read in data
+data = mash_set_data(betas_mtb, standard_errors_mtb)
+
+#estimate correlations
+V.simple = estimate_null_correlation_simple(data)
+data.Vsimple = mash_update_data(data, V=V.simple)
+
+## Step 2: Set up the covariance matrices
+#Step 2a: Canonical
+U.c = cov_canonical(data.Vsimple)
+
+## Step 2b: Obtain data-driven covariance matrices
+#Select strong signals
+m.1by1 = mash_1by1(data.Vsimple)
+strong = get_significant_results(m.1by1, thresh = 0.05) # this gives 3,300 genes 
+strong_betas <- betas_mtb[strong,]
+
+#obtain initial data_driven covariance matrices
+U.pca = cov_pca(data.Vsimple, 2, subset=strong)
+
+#perform extreme deconvolution
+U.ed = cov_ed(data.Vsimple, U.pca, subset=strong)
+
+#Step 3: fit the model
+m = mash(data.Vsimple, c(U.c,U.ed))
+print(get_loglik(m),digits = 10)
+
+#Step 4: Extract Posterior Summaries
+mashed_betas_mtb <- get_pm(m) %>% as.data.frame()
+mashed_se_mtb <- get_psd(m) %>% as.data.frame()
+mashed_lfsr_mtb <- get_lfsr(m) %>% as.data.frame()
+```
+
+2)
+```{r}
+library(mashr)
+
+## Step 1: Read in the data and account for correlations among measurements
+#read in data
+data = mash_set_data(betas_NI, standard_errors_NI)
+
+#estimate correlations
+V.simple = estimate_null_correlation_simple(data)
+data.Vsimple = mash_update_data(data, V=V.simple)
+
+## Step 2: Set up the covariance matrices
+#Step 2a: Canonical
+U.c = cov_canonical(data.Vsimple)
+
+## Step 2b: Obtain data-driven covariance matrices
+#Select strong signals
+m.1by1 = mash_1by1(data.Vsimple)
+strong = get_significant_results(m.1by1, thresh = 0.05) # this gives 3,300 genes 
+strong_betas <- betas_mtb[strong,]
+
+#obtain initial data_driven covariance matrices
+U.pca = cov_pca(data.Vsimple, 2, subset=strong)
+
+#perform extreme deconvolution
+U.ed = cov_ed(data.Vsimple, U.pca, subset=strong)
+
+#Step 3: fit the model
+m = mash(data.Vsimple, c(U.c,U.ed))
+print(get_loglik(m),digits = 10)
+
+#Step 4: Extract Posterior Summaries
+mashed_betas_NI <- get_pm(m) %>% as.data.frame()
+mashed_se_NI <- get_psd(m) %>% as.data.frame()
+mashed_lfsr_NI <- get_lfsr(m) %>% as.data.frame()
+```
+
+#### Get DEGs using mash stats 
+Plot distributions to make an educated choice on the threshold. 
+
+1) Mtb
+```{r, fig.height=8, fig.height=10}
+mashed_lfsr_mtb_long <- pivot_longer(mashed_lfsr_mtb, cols = everything(), names_to = "Timepoint", values_to = "Mashed_lfsr")
+mashed_lfsr_mtb_long$Timepoint <- factor(mashed_lfsr_mtb_long$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"))
+
+ggplot(data = mashed_lfsr_mtb_long, aes(x = Mashed_lfsr, fill = Timepoint)) +
+  geom_histogram(binwidth = 5e-3, lwd = 0.5, color = NA) +
+  geom_vline(xintercept = c(0.1, 0.05, 0.01), linetype = "dashed") +
+  facet_wrap(~Timepoint, ncol = 3, scales = "free_y") +
+  ggsci::scale_fill_uchicago() +
+  theme_bw()
+```
+
+2) NI
+```{r, fig.height=8, fig.height=10}
+mashed_lfsr_NI_long <- pivot_longer(mashed_lfsr_NI, cols = everything(), names_to = "Timepoint", values_to = "Mashed_lfsr")
+mashed_lfsr_NI_long$Timepoint <- factor(mashed_lfsr_NI_long$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"))
+
+ggplot(data = mashed_lfsr_NI_long, aes(x = Mashed_lfsr, fill = Timepoint)) +
+  geom_histogram(binwidth = 5e-3, lwd = 0.5, color = NA) +
+  geom_vline(xintercept = c(0.1, 0.05, 0.01), linetype = "dashed") +
+  facet_wrap(~Timepoint, ncol = 3, scales = "free_y") +
+  ggsci::scale_fill_uchicago() +
+  theme_bw()
+```
+
+Get results
+```{r}
+#join betas and lsfr:
+mashed_results_mtb <- mashed_betas_mtb %>% rownames_to_column("gene_id") %>% pivot_longer(cols = 2:last_col(), names_to = "Timepoint", values_to = "Mashed_Betas")
+
+mashed_results_mtb <- mashed_lfsr_mtb %>% rownames_to_column("gene_id") %>% pivot_longer(cols = 2:last_col(), names_to = "Timepoint", values_to = "lfsr") %>% left_join(x = mashed_results_mtb, by = c("gene_id", "Timepoint"))
+
+#join betas and lsfr:
+mashed_results_NI <- mashed_betas_NI %>% rownames_to_column("gene_id") %>% pivot_longer(cols = 2:last_col(), names_to = "Timepoint", values_to = "Mashed_Betas")
+
+mashed_results_NI <- mashed_lfsr_NI %>% rownames_to_column("gene_id") %>% pivot_longer(cols = 2:last_col(), names_to = "Timepoint", values_to = "lfsr") %>% left_join(x = mashed_results_NI, by = c("gene_id", "Timepoint"))
+```
+
+Filter
+```{r}
+mashed_result_sig_mtb <- dplyr::filter(mashed_results_mtb, lfsr < 0.05)
+mashed_result_sig_NI <- dplyr::filter(mashed_results_NI, lfsr < 0.05)
+```
+
+How many genes total?
+```{r}
+#Mtb
+as.data.frame(mashed_result_sig_mtb$gene_id) %>% distinct() %>% nrow()
+#NI
+as.data.frame(mashed_result_sig_NI$gene_id) %>% distinct() %>% nrow()
+```
+
+How many genes per timepoint?
+```{r}
+for (i in c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")) {
+  print(i)
+  dplyr::filter(mashed_result_sig_mtb, Timepoint == i)[, "gene_id"] %>% as.data.frame() %>% distinct() %>% nrow() %>% print()
+}
+```
+```{r}
+for (i in c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")) {
+  print(i)
+  dplyr::filter(mashed_result_sig_NI, Timepoint == i)[, "gene_id"] %>% as.data.frame() %>% distinct() %>% nrow() %>% print()
+}
+```
+
+```{r}
+number_DEGs <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36")), 
+                          Mtb = c(1497, 2491, 1698, 1226, 1203, 1029, 1092, 1188, 1071), 
+                          NI = c(1835, 4194, 3805, 3572, 3535, 3174, 2741, 2421, 1214)) %>% pivot_longer(cols = 2:3, names_to = "Infection", values_to = "number_DEGs")
+
+degs_plot <- ggplot(number_DEGs, aes(x = Time, y = number_DEGs, group = Infection, color = Infection)) +
+  geom_line() +
+  geom_text(aes(label = number_DEGs), nudge_y = 200) + 
+  geom_point(size = 3) +
+  scale_color_manual(values = c("red", "grey60")) +
+  labs(y = "Number of popDEs", x  ="Timepoint",
+       title = "Number of popDEs per timepoint", 
+       subtitle = "Thresholds: lfsr < 0.05") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic")) +
+  coord_cartesian(ylim = c(0, 4500))
+
+degs_plot
+```
+
+This looks better, but is somewhat the opposite of what Haley saw. Let me see if there are any differences between the genes in NI vs Mtb vis GSEA. 
+
+### GSEA of all genes at each condition
+
+Load hallmark pathways
+```{r}
+#load Human Molecular Signatures Database (msigdb) pathways
+hallmark_pathways <- fgsea::gmtPathways("../../common-use-files/msigdb_pathways/h.all.v2023.2.Hs.symbols.gmt")
+```
+
+Loop through each timepoint for each infection
+```{r}
+#setup list to iterate through
+results_list <- list("Mtb_T1" = `TimepointT1:African_admixture_results_Mtb`, "Mtb_T3" = `TimepointT3:African_admixture_results_Mtb`, "Mtb_T5" = `TimepointT5:African_admixture_results_Mtb`, 
+                         "Mtb_T8" = `TimepointT8:African_admixture_results_Mtb`, "Mtb_T12" = `TimepointT12:African_admixture_results_Mtb`, "Mtb_T18" = `TimepointT18:African_admixture_results_Mtb`, 
+                         "Mtb_T24" = `TimepointT24:African_admixture_results_Mtb`, "Mtb_T30" = `TimepointT30:African_admixture_results_Mtb`, "Mtb_T36" = `TimepointT36:African_admixture_results_Mtb`, 
+                         "NI_T1" = `TimepointT1:African_admixture_results_NI`, "NI_T3" = `TimepointT3:African_admixture_results_NI`, "NI_T5" = `TimepointT5:African_admixture_results_NI`, 
+                         "NI_T8" = `TimepointT8:African_admixture_results_NI`, "NI_T12" = `TimepointT12:African_admixture_results_NI`, "NI_T18" = `TimepointT18:African_admixture_results_NI`, 
+                         "NI_T24" = `TimepointT24:African_admixture_results_NI`, "NI_T30" = `TimepointT30:African_admixture_results_NI`, "NI_T36" = `TimepointT36:African_admixture_results_NI`)
+
+#make dummy list
+gsea_list <- list()
+
+for (i in names(results_list)) {
+  #print element
+  print(i)
+  #assign to res
+  res <- results_list[[i]]
+  #rank by t stat
+  rank <- dplyr::arrange(res, t_statistic)
+  #isolate symbol from gene_id - run distinct to make sure there are no duplicates
+  rank <- mutate(rank, symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% distinct()
+  #make rank vector
+  rank_vec <- rank$t_statistic
+  names(rank_vec) <- rank$symbol
+  #run fgsea
+  fgseaRes <- fgsea::fgsea(hallmark_pathways, rank_vec, nproc=1)
+  #append to list
+  gsea_list[[i]] <- fgseaRes
+  #remove vars
+  rm(res, rank, rank_vec, fgseaRes)
+}
+```
+
+Select pathways with padj < 0.001 and a NES > +/- 1.5 in at least one timepoint. 
+```{r}
+select_top_pathways <- function(res) {
+  sig <- as.data.frame(res) %>% dplyr::filter(padj < 0.01)
+  top <- dplyr::filter(sig, NES > 1.5)
+  bottom <- dplyr::filter(sig, NES < -1.5)
+  return(dplyr::bind_rows(top, bottom))
+}
+
+gsea_sig_list <- lapply(gsea_list, FUN = select_top_pathways)
+
+sig_pathways <- c(gsea_sig_list$Mtb_T1$pathway, gsea_sig_list$Mtb_T3$pathway, gsea_sig_list$Mtb_T5$pathway, gsea_sig_list$Mtb_T8$pathway,
+                  gsea_sig_list$Mtb_T12$pathway, gsea_sig_list$Mtb_T16$pathway, gsea_sig_list$Mtb_T24$pathway, gsea_sig_list$Mtb_T30$pathway, gsea_sig_list$Mtb_T36$pathway, 
+                  gsea_sig_list$NI_T1$pathway, gsea_sig_list$NI_T3$pathway, gsea_sig_list$NI_T5$pathway, gsea_sig_list$NI_T8$pathway,
+                  gsea_sig_list$NI_T12$pathway, gsea_sig_list$NI_T16$pathway, gsea_sig_list$NI_T24$pathway, gsea_sig_list$NI_T30$pathway, gsea_sig_list$NI_T36$pathway) %>% unique() %>% as.data.frame()
+colnames(sig_pathways) <- "pathway"
+```
+
+Now that we have top pathways, extract NES from each timepoint and put into a dataframe
+```{r}
+for (i in c("Mtb_T1", "Mtb_T3", "Mtb_T5", "Mtb_T8", "Mtb_T12", "Mtb_T18", "Mtb_T24", "Mtb_T30", "Mtb_T36", 
+            "NI_T1", "NI_T3", "NI_T5", "NI_T8", "NI_T12", "NI_T18", "NI_T24", "NI_T30", "NI_T36")) {
+  #extract timepoint
+  res <- gsea_list[[i]] %>% as.data.frame()
+  #intersect with sig pathways
+  res <- inner_join(res, sig_pathways, by = "pathway")
+  #parse if fiirst time to add pathway
+  if (i == "Mtb_T1") {
+    gsea_sig_df <- dplyr::transmute(res, pathway, !!i := NES)
+  }
+  if (i != "Mtb_T1") {
+  #add to a new column of df
+    res <- dplyr::transmute(res, pathway, !!i := NES)
+    gsea_sig_df <- left_join(gsea_sig_df, res, by = "pathway")
+  }
+  rm(res)
+}
+```
+
+Pivot longer
+```{r}
+#order by mean NES
+gsea_sig_df <- mutate(gsea_sig_df, mean_NES = rowMeans(across(-1))) %>%
+  arrange(desc(mean_NES)) %>%
+  select(1, everything()) %>% dplyr::select(-mean_NES)
+
+#remove "hallmark_" from each pathway
+gsea_sig_df <- mutate(gsea_sig_df, pathway = str_remove(pathway, "HALLMARK_"))
+
+gsea_sig_df$pathway <- factor(gsea_sig_df$pathway, levels = rev(c(gsea_sig_df$pathway)))
+
+gsea_sig_df <- pivot_longer(gsea_sig_df, cols = 2:last_col(), names_to = "Timepoint", values_to = "NES")
+
+gsea_sig_df$Timepoint <- factor(gsea_sig_df$Timepoint, levels = c("Mtb_T1", "Mtb_T3", "Mtb_T5", "Mtb_T8", "Mtb_T12", "Mtb_T18", "Mtb_T24", "Mtb_T30", "Mtb_T36", 
+            "NI_T1", "NI_T3", "NI_T5", "NI_T8", "NI_T12", "NI_T18", "NI_T24", "NI_T30", "NI_T36"))
+```
+
+Plot results as a heatmap with x=time, y=pathway, color=NES
+```{r, fig.width=7.5, fig.height=8}
+library(RColorBrewer)
+my_palette <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(50)
+
+gsea_heatmap <- ggplot(gsea_sig_df, aes(x = Timepoint, y = pathway, fill = NES)) +
+  geom_tile(color = "white", lwd = 0.5) +
+  scale_fill_gradientn(colors = my_palette) +
+  labs(title = "Gene Set Enrichment Analysis of Ancestry Effects for each Timepoint and Condition",
+       subtitle = "*only pathways with padj < 0.001 and a NES > +/- 1.5\nin at least one timepoint are shown",
+       x = "Time Post-Infection (hrs)", 
+       y = "Hallmark Pathways") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+        plot.subtitle = element_text(hjust = 0.5, face = "italic"), 
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  coord_equal()
+
+gsea_heatmap
+```
+
+
+
+
+
+

@@ -1,0 +1,209 @@
+---
+title: "Pairwise Correlation of Baseline Expression Between Donors"
+output: html_document
+date: "2024-02-09"
+name: Tyler Hansen
+---
+
+For a grant, Luis asked if I could generate a boxplot showing pairwise correlation in gene expression levels across all individuals in the timecourse data. Specifically, he only wants it for baseline condidions, which means T0/T1 for NI condidions. He want's it because the reviewers are questioning reproducibility when using iPSC-derived macrophages. He estimates the mean correlation should be 0.94 for spearman and pearson. 
+
+Essentially, he wants to know what is the distribution of correlation values when comparing individual 1 against each of the other samples. So Y will be correlations (r^2, rho), X will be individuals, and the dots will be each pairwise correlation between that individual and the others. 
+
+I will try both spearman and pearson correlations. 
+
+## Setup
+
+### Packages
+```{r, echo=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+suppressPackageStartupMessages(library(GenomicFeatures))
+library(GenomicRanges)
+library(rtracklayer)
+suppressPackageStartupMessages(library(plyranges))
+```
+
+### Setup Three Tables
+```{r}
+#read in cts
+cts_all <- read_tsv("data/kallisto.gene-level.lengthScaledTPM.tsv", show_col_types = F)
+
+#read in gtf
+gtf <- readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+
+#read in sample info/metadata
+sample_info_all <- read_tsv("results/metadata_with-covariates.tsv", col_names = T, show_col_types = F) %>% column_to_rownames("filename")
+```
+
+## Filter samples and counts
+
+1) protein coding filter
+```{r}
+#extract protein coding genes. I checked and this entire pipe works. 
+pc_gene_ids <- plyranges::filter(gtf, type == 'gene', gene_biotype == 'protein_coding') %>% as.data.frame() %>% dplyr::select(gene_id, gene_name)
+
+#join with counts to select protein coding genes.
+cts_pc <- left_join(pc_gene_ids, cts_all, by = 'gene_id')
+
+#merge ensembl_id and gene name and set as to rownames. 
+cts_pc <- unite(cts_pc, "ID", gene_id:gene_name, sep = "_") %>% column_to_rownames(var = "ID")
+```
+
+2) select baseline samples
+```{r}
+#filter sample_info
+baseline_SI <- dplyr::filter(sample_info_all, Infection == "NI", Timepoint %in% c("T0", "T1"))
+
+#AF69 is double, so remove the run2 sample
+baseline_SI <- baseline_SI[!(rownames(baseline_SI) == "kallisto_14_AF69_T1_NI_run2"), ]
+
+#filter samples from cts
+cts_pc_base <- dplyr::select(cts_pc, intersect(colnames(cts_pc), row.names(baseline_SI))) 
+```
+
+3) remove low count data by voom-transformed row medians > 1
+```{r}
+#set design matrix for voom transformation
+design <- model.matrix(~ self_reported_ethnicity, data = baseline_SI)
+
+#voom transform first
+dge_1 <- DGEList(cts_pc_base)
+dge_1 <- calcNormFactors(dge_1)
+v_1 <- voom(dge_1, design, plot = F)
+
+#filter genes based on voom-transformed row medians > 1. This is equivalent to 10^1 = 10 raw counts. This is much more stringent.  
+keep <- data.frame(genes = rownames(cts_pc_base), medians = apply(v_1$E, 1, median), order = 1:nrow(cts_pc_base))
+cts_pc_base_low <- cts_pc_base[which(keep$medians > 1), ]
+
+#report how much was lost
+print('total features remaining')
+nrow(cts_pc_base_low)
+print('total features removed') 
+nrow(cts_pc_base) - nrow(cts_pc_base_low)
+```
+
+Save as rds
+```{r}
+saveRDS(cts_pc_base_low, file = "results/baseline_pairwise_correlation_forLuis/cts_pc_base_low.rds")
+```
+
+
+## Calculate correlation
+
+Change colnames to donor_id for plotting purposes
+```{r}
+all(colnames(cts_pc_base_low) == rownames(baseline_SI))
+colnames(cts_pc_base_low) <- baseline_SI$Donor_ID
+baseline_SI <- remove_rownames(baseline_SI) %>% column_to_rownames("Donor_ID")
+```
+
+Voom transform
+```{r}
+dge_2 <- DGEList(cts_pc_base_low)
+dge_2 <- calcNormFactors(dge_2)
+v_2 <- voom(dge_2, design, plot = T)
+```
+
+Calculate pairwise correlation
+```{r}
+corr_mat_pear <- cor(v_2$E, method = "pearson")
+corr_mat_spear <- cor(v_2$E, method = "spearman")
+```
+
+Convert to df
+```{r}
+corr_df_pear <- as.data.frame(corr_mat_pear) %>% rownames_to_column("Donor_ID") %>%
+  pivot_longer(cols = c(2:last_col()), names_to = "Donor_ID_2", values_to = "Pearson Correlation")
+
+corr_df_spear <- as.data.frame(corr_mat_spear) %>% rownames_to_column("Donor_ID") %>%
+  pivot_longer(cols = c(2:last_col()), names_to = "Donor_ID_2", values_to = "Spearman Correlation")
+```
+
+Remove identical comparisons
+```{r}
+corr_df_pear <- dplyr::filter(corr_df_pear, Donor_ID != Donor_ID_2)
+corr_df_spear <- dplyr::filter(corr_df_spear, Donor_ID != Donor_ID_2)
+```
+
+Plot
+```{r}
+p_pear <- ggplot(corr_df_pear, aes(x = Donor_ID, y = `Pearson Correlation`)) +
+  geom_boxplot(aes(fill = Donor_ID), alpha = 0.75, outlier.alpha = 0) +
+  geom_jitter(aes(color = Donor_ID), alpha = 0.25, size = 1) +
+  scale_fill_viridis_d(option = "mako", begin = 0.25, end = 0.75) +
+  scale_color_viridis_d(option = "mako", begin = 0.25, end = 0.75) +
+  scale_y_continuous(breaks = seq(0,1,0.1)) +
+  labs(x = "Donor", y = "Pearson Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene Expression Levels Across All Donors") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90), plot.title = element_text(hjust = 0.5)) +
+  coord_cartesian(ylim = c(0,1))
+
+p_pear
+```
+
+```{r}
+p_spear <- ggplot(corr_df_spear, aes(x = Donor_ID, y = `Spearman Correlation`)) +
+  geom_boxplot(aes(fill = Donor_ID), alpha = 0.75, outlier.alpha = 0) +
+  geom_jitter(aes(color = Donor_ID), alpha = 0.25, size = 1) +
+  scale_fill_viridis_d(option = "rocket", begin = 0.25, end = 0.75) +
+  scale_color_viridis_d(option = "rocket", begin = 0.25, end = 0.75) +
+  scale_y_continuous(breaks = seq(0,1,0.1)) +
+  labs(x = "Donor", y = "Spearman Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene Expression Levels Across All Donors") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90), plot.title = element_text(hjust = 0.5)) +
+  coord_cartesian(ylim = c(0,1))
+
+p_spear
+```
+
+Export figures
+```{r}
+ggsave(plot = p_pear, filename = "results/baseline_pairwise_correlation_forLuis/boxplot_pearson.pdf", device = cairo_pdf, width = 8, height = 5)
+ggsave(plot = p_spear, filename = "results/baseline_pairwise_correlation_forLuis/boxplot_spearman.pdf", device = cairo_pdf, width = 8, height = 5)
+```
+
+Plot single boxplots
+```{r}
+p_pear <- ggplot(corr_df_pear, aes(x = "x", y = `Pearson Correlation`)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0, fill ="steelblue") +
+  geom_jitter(alpha = 0.25, size = 1, color ="steelblue") +
+  scale_y_continuous(breaks = seq(0,1,0.1)) +
+  labs(x = "", y = "Pearson Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene\nExpression Between Donors") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90), plot.title = element_text(hjust = 0.5, size = 12),
+        axis.text.x.bottom = element_blank(), axis.ticks.x = element_blank(), panel.grid.major.x = element_blank()) +
+  coord_cartesian(ylim = c(0,1))
+
+p_pear
+```
+
+```{r}
+p_spear <- ggplot(corr_df_spear, aes(x = "x", y = `Spearman Correlation`)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0, fill ="firebrick") +
+  geom_jitter(alpha = 0.25, size = 1, color ="firebrick") +
+  scale_y_continuous(breaks = seq(0,1,0.1)) +
+  labs(x = "", y = "Spearman Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene\nExpression Between Donors") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90), plot.title = element_text(hjust = 0.5, size = 12),
+        axis.text.x.bottom = element_blank(), axis.ticks.x = element_blank(), panel.grid.major.x = element_blank()) +
+  coord_cartesian(ylim = c(0,1))
+
+p_spear
+```
+
+Export figures
+```{r}
+ggsave(plot = p_pear, filename = "results/baseline_pairwise_correlation_forLuis/boxplot_pearson_single.pdf", device = cairo_pdf, width = 3, height = 5)
+ggsave(plot = p_spear, filename = "results/baseline_pairwise_correlation_forLuis/boxplot_spearman_single.pdf", device = cairo_pdf, width = 3, height = 5)
+```
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

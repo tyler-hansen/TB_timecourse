@@ -1,0 +1,1493 @@
+---
+title: "Explore Modeling Approach"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 4.9.2024
+
+Previously, we prepared the data and metadata. Now that we have the right samples and right counts, we need to figure out how to best model the data. This includes identifying which variables are confounding and observing the data when they are confounding. 
+
+First, we will perform an analysis to identify the variance explained by each technical confounder. 
+
+## Setup 
+
+Packages
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+```
+
+Three tables
+```{r}
+#read in GTF
+#gtf <- rtracklayer::readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+
+#read in SI
+sample_info <- readRDS("data/metadata_with-covariates_final_samples.rds")
+
+#read in cts
+cts <- readRDS("data/filtered_counts_final_samples.rds")
+```
+
+## Voom transform
+```{r}
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+design_base <- model.matrix(~1, sample_info)
+v <- voom(dge, design_base, plot = T)
+```
+
+## Double check lib size and count distribution
+```{r}
+tmp_1 <- dge$samples %>% as.data.frame()
+
+ggplot(data=tmp_1, aes(x=log10(lib.size))) +
+    geom_histogram(binwidth = 0.05, color = "grey", fill = "ivory") +
+    geom_jitter(color = "black", alpha = 0.5, aes(y = 0), height = 5) +
+    theme_bw() +
+    ylab("count") +
+    theme(legend.position = "none")
+
+rm(tmp_1)
+
+tmp_2 <- as.data.frame(v$E) %>% rownames_to_column("gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+
+ggplot(data=tmp_2, aes(x=counts, group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+rm(tmp_2)
+```
+
+Looks great. Feels good to just double check!
+
+## Check varaible balance
+
+Determine if confounding categorical variables are balanced across experimental using tables. 
+
+Check ancestry
+```{r}
+table(sample_info$self_reported_ethnicity, sample_info$flow_cell)
+table(sample_info$self_reported_ethnicity, sample_info$Run)
+table(sample_info$self_reported_ethnicity, sample_info$db)
+table(sample_info$self_reported_ethnicity, sample_info$Sex)
+table(sample_info$self_reported_ethnicity, sample_info$Location)
+```
+
+Run 3 and 4 are heavily AA individuals. This could potentially be a problem. Especially for Run3. The others are generally well-balanced. 
+
+Check timepoint
+```{r}
+table(sample_info$Timepoint, sample_info$flow_cell)
+table(sample_info$Timepoint, sample_info$Run)
+table(sample_info$Timepoint, sample_info$db)
+table(sample_info$Timepoint, sample_info$Sex)
+table(sample_info$Timepoint, sample_info$Location)
+```
+
+Flow cell by timepoint isn't balanced, but this should be fine as my analysis will be by timepoint not across timepoints. 
+
+Check Infection
+```{r}
+table(sample_info$Infection, sample_info$flow_cell)
+table(sample_info$Infection, sample_info$Run)
+table(sample_info$Infection, sample_info$db)
+table(sample_info$Infection, sample_info$Sex)
+table(sample_info$Infection, sample_info$Location)
+```
+
+Data is well balanced across conditions.
+
+Check distribution of continuous covariates across important categorical variables
+
+perc_Dups
+```{r}
+ggplot(sample_info, aes(x = perc_Dups, color = self_reported_ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Dups, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Dups, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+The balance is okay. 
+
+perc_Aligned
+```{r}
+ggplot(sample_info, aes(x = perc_Aligned, color = self_reported_ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Aligned, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Aligned, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+They are okay. Infection is not great. 
+
+perc_GC
+```{r}
+ggplot(sample_info, aes(x = perc_GC, color = self_reported_ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_GC, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_GC, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+Infection is not super well balanced, if the variance is not high, maybe best to not include. For ethnicity is is really good. 
+
+
+
+## Check confounding variables (and others) using PCA plots
+
+### No correction
+
+Calculate PCs
+```{r}
+mat <- as.matrix(v$E) %>% t()
+pcamat <- prcomp(mat)
+```
+
+Plot variance explained by top 20 PCAs
+```{r}
+#variance explained by PCs
+pc_eigenvalues <- pcamat$sdev^2
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), variance = pc_eigenvalues) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+
+ggplot(pc_eigenvalues , aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + coord_cartesian(xlim = c(0,20))
+```
+
+PC1 and PC2 explains a lot, but it looks like PCs1-5 contribute a notable amount as well.  
+
+Plot PC1 and PC2 and use color/point type for variables
+```{r, fig.dim=c(9,5)}
+#Prepare df for plotting, just select the first 20 PCs
+pc_scores <- as.data.frame(pcamat$x)[, 1:20] %>% rownames_to_column(var = "filename")
+
+#add metadata
+pc_scores <- rownames_to_column(sample_info, var = "filename") %>% left_join(x = pc_scores, by = "filename")
+
+#relevel infection:
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#make new col for AF69
+pc_scores <- mutate(pc_scores, is_AF69 = (Donor_ID == "AF69"))
+
+#prep dfs for AF69 highlight
+pc_scores_not_AF69 <- dplyr::filter(pc_scores, is_AF69 == FALSE)
+pc_scores_AF69 <- dplyr::filter(pc_scores, is_AF69 == TRUE)
+
+#To pc_scores AF69 add a column that has an id specifiying the pair they are a part of. Do this by making a dummy df and then looping through time, assigning a pair column and appending to the dummy df. 
+pc_scores_AF69_pairID <- data.frame()
+for (i in c("T1","T3","T5","T8","T12","T18","T24","T30","T36","T48")){
+  tmp_1 <- dplyr::filter(pc_scores_AF69, Donor_ID == "AF69" & Infection == "Mtb" & Timepoint == i) %>% mutate(pair_id = paste0("Mtb_", i))
+  tmp_2 <- dplyr::filter(pc_scores_AF69, Donor_ID == "AF69" & Infection == "NI" & Timepoint == i) %>% mutate(pair_id = paste0("NI_", i))
+  pc_scores_AF69_pairID <- bind_rows(pc_scores_AF69_pairID, tmp_1, tmp_2)
+  rm(tmp_1, tmp_2)
+}
+
+#factorize pc_scores_AF69_pairID
+pc_scores_AF69_pairID$pair_id <- factor(pc_scores_AF69_pairID$pair_id, levels = c("Mtb_T1", "Mtb_T3", "Mtb_T5", "Mtb_T8", "Mtb_T12", "Mtb_T18", "Mtb_T24", "Mtb_T30", "Mtb_T36", "Mtb_T48", "NI_T1", "NI_T3", "NI_T5", "NI_T8", "NI_T12", "NI_T18", "NI_T24", "NI_T30", "NI_T36", "NI_T48"))
+```
+
+Plot PC1 vs. PC2 and annotate with infection and other variables
+```{r, fig.height=6, fig.width=7}
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_run <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Run, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_sex <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Sex, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_db <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = db, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_AF69 <- ggplot() +
+  geom_point(data = pc_scores_not_AF69, aes(x = PC1, y = PC2), alpha = 0.5, color = "grey", shape = 19) +
+  geom_point(data = pc_scores_AF69_pairID, aes(x = PC1, y = PC2, color = pair_id), shape = 19) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_donor
+p_run
+p_flow
+p_sex
+p_db
+p_AF69
+```
+
+The timepoint PCA shows that PC1 is primarily the infection effect. PC2 looks like the time effect, to an extent. 
+
+The Run PCA shows there are clear batch effects between NI samples and this is along the NI-vs.-infection status. This effect is less for the Mtb samples. 
+
+The flow cell PCA shows there is a flow cell effect in PC1. 
+
+_Conclusion_
+So I thought about it and considered that the major effects I am seeing are differences between the data Haley had (run1) and the new data (run 2,3,4). Therefore I think grouping haley's data into a new "batch" variable - "batch1" - and then grouping the new data into "batch2" and then using batch and flow_cell in the model, is the most appropriate way forward. Adding "batch" enables me to include this new batch variable AND the flow cell that was used. This is obviously not perfect since run2, run3, and run4 are distinct batches but the thinking is their effects are removed at the level of flow cell.
+
+### Observe PCA of corrected expression for the infection and ancestry models
+
+Add Batch 1|2 to sample info
+```{r}
+sample_info <- mutate(sample_info, batch = case_when(Run == "run1" ~ "batch1", 
+                                                     Run %in% c("run2", "run3", "run4") ~ "batch2"))
+
+sample_info$batch <- factor(sample_info$batch)
+
+sample_info$flow_cell <- factor(sample_info$flow_cell, levels = c("1", "2", "3", "4", "5", "6", "7"))
+```
+
+In order to model ancestry effects, modify the sample info so that each donor has ancestry measures.  Specifically, assign average admixture of each ethnicity to the NA values. 
+```{r}
+AA_average <- dplyr::filter(sample_info, self_reported_ethnicity == "AA")$African_admixture %>% mean(na.rm = T)
+EA_average <- dplyr::filter(sample_info, self_reported_ethnicity == "EA")$African_admixture %>% mean(na.rm = T)
+
+sample_info$African_admixture[is.na(sample_info$African_admixture)& sample_info$self_reported_ethnicity == "AA"] <- AA_average
+sample_info$African_admixture[is.na(sample_info$African_admixture)& sample_info$self_reported_ethnicity == "EA"] <- EA_average
+```
+
+Subset sample info and counts into condition specific groups so that the nested models can be made per timepoint for each condition.
+```{r}
+sample_info_Mtb <- dplyr::filter(sample_info, Infection == "Mtb")
+sample_info_NI <- dplyr::filter(sample_info, Infection == "NI")
+
+cts_Mtb <- cts[, row.names(sample_info_Mtb)]
+cts_NI <- cts[, row.names(sample_info_NI)]
+```
+
+Set designs for each model. Ancestry is condition-specific. 
+```{r}
+design_infection <- model.matrix(~ Timepoint:Infection + Timepoint + Donor_ID + batch + flow_cell + perc_GC + perc_Dups + perc_Aligned, data = sample_info)
+design_ancestry_Mtb <- model.matrix(~ Timepoint:African_admixture + Timepoint + batch + flow_cell + perc_GC + perc_Dups + perc_Aligned + Sex, data = sample_info_Mtb)
+design_ancestry_NI <- model.matrix(~ Timepoint:African_admixture + Timepoint + batch + flow_cell + perc_GC + perc_Dups + perc_Aligned + Sex, data = sample_info_NI)
+
+#remove unestimable columns
+design_infection <- design_infection[, !colnames(design_infection) %in% c("flow_cell7", "Donor_IDAF145")]
+design_ancestry_Mtb <- design_ancestry_Mtb[, !colnames(design_ancestry_Mtb) %in% c("flow_cell7")]
+design_ancestry_NI <- design_ancestry_NI[, !colnames(design_ancestry_NI) %in% c("flow_cell7")]
+```
+
+Check that design and cts match
+```{r}
+#this should print true
+all(rownames(design_infection) == colnames(cts))
+all(rownames(design_ancestry_Mtb) == colnames(cts_Mtb))
+all(rownames(design_ancestry_NI) == colnames(cts_NI))
+```
+
+Voom transform - this was done above but repeat again to ensure the object is what we think it is
+```{r}
+v_infection <- DGEList(cts) %>% calcNormFactors() %>% voom(design_infection) 
+v_ancestry_Mtb <- DGEList(cts_Mtb) %>% calcNormFactors() %>% voom(design_ancestry_Mtb) 
+v_ancestry_NI <- DGEList(cts_NI) %>% calcNormFactors() %>% voom(design_ancestry_NI) 
+```
+
+Fit to models
+```{r}
+vfit_infection <- lmFit(v_infection, design_infection) %>% eBayes()
+vfit_ancestry_Mtb <- lmFit(v_ancestry_Mtb, design_ancestry_Mtb) %>% eBayes()
+vfit_ancestry_NI <- lmFit(v_ancestry_NI, design_ancestry_NI) %>% eBayes()
+```
+
+Get corrected expression by adding the relevant coefficients to the residuals. 
+```{r}
+corrected_infection <- residuals(vfit_infection, v_infection) + vfit_infection$coefficients[,"TimepointT1:InfectionMtb"]%*%t(design_infection[,"TimepointT1:InfectionMtb"]) + 
+  vfit_infection$coefficients[,"TimepointT3:InfectionMtb"]%*%t(design_infection[,"TimepointT3:InfectionMtb"]) + vfit_infection$coefficients[,"TimepointT5:InfectionMtb"]%*%t(design_infection[,"TimepointT5:InfectionMtb"]) + 
+  vfit_infection$coefficients[,"TimepointT8:InfectionMtb"]%*%t(design_infection[,"TimepointT8:InfectionMtb"]) + vfit_infection$coefficients[,"TimepointT12:InfectionMtb"]%*%t(design_infection[,"TimepointT12:InfectionMtb"]) + 
+  vfit_infection$coefficients[,"TimepointT18:InfectionMtb"]%*%t(design_infection[,"TimepointT18:InfectionMtb"]) + vfit_infection$coefficients[,"TimepointT24:InfectionMtb"]%*%t(design_infection[,"TimepointT24:InfectionMtb"]) + 
+  vfit_infection$coefficients[,"TimepointT30:InfectionMtb"]%*%t(design_infection[,"TimepointT30:InfectionMtb"]) + vfit_infection$coefficients[,"TimepointT36:InfectionMtb"]%*%t(design_infection[,"TimepointT36:InfectionMtb"]) +
+  vfit_infection$coefficients[,"TimepointT48:InfectionMtb"]%*%t(design_infection[,"TimepointT48:InfectionMtb"])
+```
+
+```{r}
+corrected_ancestry_Mtb <- residuals(vfit_ancestry_Mtb, v_ancestry_Mtb) + vfit_ancestry_Mtb$coefficients[,"TimepointT1:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT1:African_admixture"]) + 
+  vfit_ancestry_Mtb$coefficients[,"TimepointT3:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT3:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT5:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT5:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT8:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT8:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT12:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT12:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT18:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT18:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT24:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT24:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT30:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT30:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT36:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT36:African_admixture"]) +
+  vfit_ancestry_Mtb$coefficients[,"TimepointT48:African_admixture"]%*%t(design_ancestry_Mtb[,"TimepointT48:African_admixture"]) 
+```
+
+```{r}
+corrected_ancestry_NI <- residuals(vfit_ancestry_NI, v_ancestry_NI) + vfit_ancestry_NI$coefficients[,"TimepointT1:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT1:African_admixture"]) + 
+  vfit_ancestry_NI$coefficients[,"TimepointT3:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT3:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT5:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT5:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT8:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT8:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT12:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT12:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT18:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT18:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT24:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT24:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT30:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT30:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT36:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT36:African_admixture"]) +
+  vfit_ancestry_NI$coefficients[,"TimepointT48:African_admixture"]%*%t(design_ancestry_NI[,"TimepointT48:African_admixture"]) 
+```
+
+Calculate PCs from corrected expression. Add the values from Mtb and NI together. 
+```{r}
+#This will print true if gene order is preserved:
+all(rownames(corrected_ancestry_Mtb) == rownames(corrected_ancestry_NI))
+corrected_ancestry <- bind_cols(corrected_ancestry_Mtb, corrected_ancestry_NI)
+
+pc_infection <- as.matrix(corrected_infection) %>% t() %>% prcomp()
+pc_ancestry <- as.matrix(corrected_ancestry) %>% t() %>% prcomp()
+```
+
+Plot variance explained by top 20 PCAs for each
+```{r}
+#infection
+tmp <- pc_infection$sdev^2
+tmp <- tibble(PC = factor(1:length(tmp)), variance = tmp) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+ggplot(tmp, aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + 
+  theme_bw() +
+  coord_cartesian(xlim = c(0,20))
+rm(tmp)
+
+#ancestry
+tmp <- pc_ancestry$sdev^2
+tmp <- tibble(PC = factor(1:length(tmp)), variance = tmp) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+ggplot(tmp, aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + 
+  theme_bw() +
+  coord_cartesian(xlim = c(0,20))
+rm(tmp)
+```
+
+Prepare PCs for plotting
+```{r}
+prep_df_for_PCA <- function(pc, si) {
+  #Prepare df for plotting, just select the first 20 PCs
+  pc_scores <- as.data.frame(pc$x)[, 1:20] %>% rownames_to_column(var = "filename")
+
+  #add metadata
+  pc_scores <- rownames_to_column(si, var = "filename") %>% left_join(x = pc_scores, by = "filename")
+
+  #relevel infection:
+  pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+  #make new col for AF69
+  pc_scores <- mutate(pc_scores, is_AF69 = (Donor_ID == "AF69"))
+
+  #prep dfs for AF69 highlight
+  pc_scores_not_AF69 <- dplyr::filter(pc_scores, is_AF69 == FALSE)
+  pc_scores_AF69 <- dplyr::filter(pc_scores, is_AF69 == TRUE)
+
+  #To pc_scores AF69 add a column that has an id specifiying the pair they are a part of. Do this by making a dummy df and then looping through time, assigning a pair column and appending to the dummy df. 
+  pc_scores_AF69_pairID <- data.frame()
+  for (i in c("T1","T3","T5","T8","T12","T18","T24","T30","T36","T48")){
+    tmp_1 <- dplyr::filter(pc_scores_AF69, Donor_ID == "AF69" & Infection == "Mtb" & Timepoint == i) %>% mutate(pair_id = paste0("Mtb_", i))
+    tmp_2 <- dplyr::filter(pc_scores_AF69, Donor_ID == "AF69" & Infection == "NI" & Timepoint == i) %>% mutate(pair_id = paste0("NI_", i))
+    pc_scores_AF69_pairID <- bind_rows(pc_scores_AF69_pairID, tmp_1, tmp_2)
+    rm(tmp_1, tmp_2)
+  }
+
+  #factorize pc_scores_AF69_pairID
+  pc_scores_AF69_pairID$pair_id <- factor(pc_scores_AF69_pairID$pair_id, levels = c("Mtb_T1", "Mtb_T3", "Mtb_T5", "Mtb_T8", "Mtb_T12", "Mtb_T18", "Mtb_T24", "Mtb_T30", "Mtb_T36", "Mtb_T48", 
+                                                                                    "NI_T1", "NI_T3", "NI_T5", "NI_T8", "NI_T12", "NI_T18", "NI_T24", "NI_T30", "NI_T36", "NI_T48"))
+
+  pc_list <- list(pc_scores, pc_scores_AF69_pairID, pc_scores_not_AF69)
+  return(pc_list)
+}
+```
+
+```{r}
+pc_infection_dfs <- prep_df_for_PCA(pc_infection, sample_info)
+pc_ancestry_dfs <- prep_df_for_PCA(pc_ancestry, sample_info)
+```
+
+Plot PC1/PC2 for corrected expression infection:
+```{r, fig.height=6, fig.width=7}
+df_list <- pc_infection_dfs
+pc_scores <- df_list[[1]]
+pc_scores_AF69_pairID <- df_list[[2]]
+pc_scores_not_AF69 <- df_list[[3]]
+rm(df_list)
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_run <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Run, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_batch <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = batch, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_sex <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Sex, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_db <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = db, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_AF69 <- ggplot() +
+  geom_point(data = pc_scores_not_AF69, aes(x = PC1, y = PC2), alpha = 0.5, color = "grey", shape = 19) +
+  geom_point(data = pc_scores_AF69_pairID, aes(x = PC1, y = PC2, color = pair_id), shape = 19) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_donor
+p_run
+p_batch
+p_flow
+p_sex
+p_db
+p_AF69
+
+rm(pc_scores, pc_scores_AF69_pairID, pc_scores_not_AF69)
+```
+
+Batch effects are removed but the AF69 doesn't cluster together well. Hmm that isn't right. 
+
+```{r}
+df_list <- pc_ancestry_dfs
+pc_scores <- df_list[[1]]
+pc_scores_AF69_pairID <- df_list[[2]]
+pc_scores_not_AF69 <- df_list[[3]]
+rm(df_list)
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_run <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Run, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_batch <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = batch, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_sex <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Sex, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_db <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = db, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_AF69 <- ggplot() +
+  geom_point(data = pc_scores_not_AF69, aes(x = PC1, y = PC2), alpha = 0.5, color = "grey", shape = 19) +
+  geom_point(data = pc_scores_AF69_pairID, aes(x = PC1, y = PC2, color = pair_id), shape = 19) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_donor
+p_run
+p_batch
+p_flow
+p_sex
+p_db
+p_AF69
+
+rm(pc_scores, pc_scores_AF69_pairID, pc_scores_not_AF69)
+```
+
+Eh. The batch effects are smaller, but they pretty much remain. Especially for the NI samples in batch 2. TRh AF69 samples are also pretty far appart. 
+
+Let's try a UMAP on the corrected counts. Run on just top 20 PCs. 
+```{r, fig.height=6, fig.width=7}
+umap_scores_from_PCs <- function(pc_mat, si) {
+  
+umap <- umap(pc_mat$x[, 1:20])
+
+#make dfs for plotting
+umap_scores <- as.data.frame(umap$layout) %>% rownames_to_column(var = "filename")
+
+#add metadata
+umap_scores <- rownames_to_column(si, var = "filename") %>% left_join(x = umap_scores, by = "filename")
+
+#relevel infection:
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+#make new col for AF69
+umap_scores <- mutate(umap_scores, is_AF69 = (Donor_ID == "AF69"))
+
+#prep dfs for AF69 highlight
+umap_scores_not_AF69 <- dplyr::filter(umap_scores, is_AF69 == FALSE)
+umap_scores_AF69 <- dplyr::filter(umap_scores, is_AF69 == TRUE)
+
+#To umap_scores AF69 add a column that has an id specifiying the pair they are a part of. Do this by making a dummy df and then looping through time, assigning a pair column and appending to the dummy df. 
+umap_scores_AF69_pairID <- data.frame()
+for (i in c("T1","T3","T5","T8","T12","T18","T24","T30","T36","T48")){
+  tmp_1 <- dplyr::filter(umap_scores_AF69, Donor_ID == "AF69" & Infection == "Mtb" & Timepoint == i) %>% mutate(pair_id = paste0("Mtb_", i))
+  tmp_2 <- dplyr::filter(umap_scores_AF69, Donor_ID == "AF69" & Infection == "NI" & Timepoint == i) %>% mutate(pair_id = paste0("NI_", i))
+  umap_scores_AF69_pairID <- bind_rows(umap_scores_AF69_pairID, tmp_1, tmp_2)
+  rm(tmp_1, tmp_2)
+}
+
+#factorize umap_scores_AF69_pairID
+umap_scores_AF69_pairID$pair_id <- factor(umap_scores_AF69_pairID$pair_id, levels = c("Mtb_T1", "Mtb_T3", "Mtb_T5", "Mtb_T8", "Mtb_T12", "Mtb_T18", "Mtb_T24", "Mtb_T30", "Mtb_T36", "Mtb_T48", "NI_T1", "NI_T3", "NI_T5", "NI_T8", "NI_T12", "NI_T18", "NI_T24", "NI_T30", "NI_T36", "NI_T48"))
+  
+umap_list <- list(umap_scores, umap_scores_AF69_pairID, umap_scores_not_AF69)
+return(umap_list)
+}
+```
+
+```{r}
+library(umap)
+umap_infection_dfs <- umap_scores_from_PCs(pc_infection, sample_info)
+umap_ancestry_dfs <- umap_scores_from_PCs(pc_ancestry, sample_info)
+```
+
+```{r}
+df_list <- umap_infection_dfs
+umap_scores <- df_list[[1]]
+umap_scores_AF69_pairID <- df_list[[2]]
+umap_scores_not_AF69 <- df_list[[3]]
+rm(df_list)
+
+p_time <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_run <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Run, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_batch <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = batch, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_sex <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Sex, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_db <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = db, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_AF69 <- ggplot() +
+  geom_point(data = umap_scores_not_AF69, aes(x = V1, y = V2), alpha = 0.5, color = "grey", shape = 19) +
+  geom_point(data = umap_scores_AF69_pairID, aes(x = V1, y = V2, color = pair_id), shape = 19) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_donor
+p_run
+p_batch
+p_flow
+p_sex
+p_db
+p_AF69
+
+rm(umap_scores, umap_scores_AF69_pairID, umap_scores_not_AF69)
+```
+
+So the UMAP retains the batch effects. PCA is better analysis but UMAP is supposed to collapse all PCs onto two dimensions. This is concerning. 
+
+```{r}
+df_list <- umap_ancestry_dfs
+umap_scores <- df_list[[1]]
+umap_scores_AF69_pairID <- df_list[[2]]
+umap_scores_not_AF69 <- df_list[[3]]
+rm(df_list)
+
+p_time <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_run <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Run, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_batch <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = batch, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_sex <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Sex, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_db <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = db, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_AF69 <- ggplot() +
+  geom_point(data = umap_scores_not_AF69, aes(x = V1, y = V2), alpha = 0.5, color = "grey", shape = 19) +
+  geom_point(data = umap_scores_AF69_pairID, aes(x = V1, y = V2, color = pair_id), shape = 19) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_donor
+p_run
+p_batch
+p_flow
+p_sex
+p_db
+p_AF69
+
+rm(umap_scores, umap_scores_AF69_pairID, umap_scores_not_AF69)
+```
+
+Also has batch effects and is also concerning. 
+
+### What genes are most effected by batch?
+```{r}
+#see if is ki67
+topTable(vfit_ancestry_NI, coef = "batchbatch2", number = Inf) %>% rownames_to_column("gene_id") %>% dplyr::filter(gene_id == "ENSG00000148773_MKI67")
+```
+
+ki67 is not really differentially expressed, so that's not likely the issue. It is but lower than most DEGs. 
+
+Let's do this globally by looking at gsea of t stat from batch coef. 
+```{r}
+#load Human Molecular Signatures Database (msigdb) pathways
+hallmark_pathways <- fgsea::gmtPathways("../../common-use-files/msigdb_pathways/h.all.v2023.2.Hs.symbols.gmt")
+
+#get all results
+res_batch_NI <- topTable(vfit_ancestry_NI, coef = "batchbatch2", number = Inf)
+res_batch_Mtb <- topTable(vfit_ancestry_Mtb, coef = "batchbatch2", number = Inf)
+
+#rank by t stat and move rownames to gene_id column
+res_batch_NI <- dplyr::arrange(res_batch_NI, t) %>% rownames_to_column("gene_id")
+res_batch_Mtb <- dplyr::arrange(res_batch_Mtb, t) %>% rownames_to_column("gene_id")
+
+#isolate symbol from rownames
+res_batch_NI <- mutate(res_batch_NI, symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% distinct()
+res_batch_Mtb <- mutate(res_batch_Mtb, symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% distinct()
+
+#make rank vector
+ranks_NI <- res_batch_NI$t
+names(ranks_NI) <- res_batch_NI$symbol
+
+ranks_Mtb <- res_batch_Mtb$t
+names(ranks_Mtb) <- res_batch_Mtb$symbol
+
+#run fgsea
+fgseaRes_NI <- fgsea::fgsea(hallmark_pathways, ranks_NI)
+fgseaRes_Mtb <- fgsea::fgsea(hallmark_pathways, ranks_Mtb)
+```
+
+Plot hallmark pathways
+```{r, fig.dim=c(10,8)}
+#NI
+topPathwaysUp <- fgseaRes_NI[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgseaRes_NI[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+all_gsea_plot <- fgsea::plotGseaTable(hallmark_pathways[topPathways], ranks_NI, fgseaRes_NI, gseaParam=0.5)
+all_gsea_plot
+
+#Mtb
+fgseaRes <- fgseaRes_Mtb
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+all_gsea_plot <- fgsea::plotGseaTable(hallmark_pathways[topPathways], ranks_Mtb, fgseaRes, gseaParam=0.5)
+all_gsea_plot
+```
+
+Oh this is not good, the batch effects are immune activation. This sugggests one batch was activated over the other. 
+
+Let's use TNF and IL6 expression as a way to gauge is one batch is more activated than the other. Look at corrected expression and then look at normalized expression before modeling. 
+
+```{r}
+#convert voom table to long format and add metadata and convert gene_id to symbol (I did this above previously in a clearer way).
+top_v <- corrected_ancestry_NI %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "corrected_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>%
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+#select the genes we care about:
+top_v <- filter(top_v, symbol %in% c("TNF", "IL6")) 
+
+#combine:
+ggplot(top_v, aes(x = Run, y = corrected_cts)) +
+  geom_boxplot(aes(fill = batch)) +
+  geom_jitter(aes(color = batch), alpha = 0.5) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  labs(title = "batch corrected counts of non-infected samples") +
+  scale_fill_manual(values = c("red", "dodgerblue")) +
+  scale_color_manual(values = c("red", "dodgerblue")) +
+  theme_bw()
+```
+
+Yep run3 is higher. Now look at uncorrected voom counts. Include IL1B and MKI67. 
+
+```{r, fig.width= 12, fig.height=6}
+#convert voom table to long format and add metadata and convert gene_id to symbol (I did this above previously in a clearer way).
+top_v <- v_ancestry_NI$E %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>%
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+#select the genes we care about:
+top_v <- filter(top_v, symbol %in% c("TNF", "IL6", "IL1B", "MKI67"))
+
+#combine:
+ggplot(top_v, aes(x = Run, y = voom_cts)) +
+  geom_boxplot(aes(fill = batch), alpha = 0.5, outlier.size = 0) +
+  geom_jitter(aes(color = batch), alpha = 0.5) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts of non-infected samples") +
+  scale_fill_manual(values = c("red", "dodgerblue")) +
+  scale_color_manual(values = c("red", "dodgerblue")) +
+  theme_bw()
+```
+
+Okay so batch 2 clearly has higher immune response genes. Lets see how it breaks down by timepoint. 
+
+```{r, fig.width= 12, fig.height=6}
+top_v_2 <- dplyr::filter(top_v, batch == "batch2")
+
+ggplot(top_v_2, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(), alpha = 0.5, outlier.size = 0, color = "grey") +
+  geom_jitter(aes(color = Run), alpha = 0.5) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts of non-infected samples", 
+       subtitle = "batch2 only") +
+  scale_color_manual(values = c("orange", "dodgerblue", "purple")) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0,15))
+
+top_v_1 <- dplyr::filter(top_v, batch == "batch1")
+
+ggplot(top_v_1, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(), alpha = 0.5, outlier.size = 0, color = "grey") +
+  geom_jitter(aes(color = Run), alpha = 0.5) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts of non-infected samples", 
+       subtitle = "batch1 only") +
+  scale_color_manual(values = c("red")) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0,15))
+
+#combined
+ggplot(top_v, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(), alpha = 0.5, outlier.size = 0, color = "grey") +
+  geom_jitter(aes(color = batch), alpha = 1) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts of non-infected samples", 
+       subtitle = "batch1 only") +
+  scale_color_manual(values = c("red", "dodgerblue")) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0,15))
+```
+
+Alright they are definitely responding to something. There are two groups. A high responding group and a low responding group. 
+
+Let's see if there it anything about these that distinguishes them. 
+
+```{r, fig.width= 12, fig.height=6}
+ggplot(top_v_2, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(), alpha = 0.5, outlier.size = 0, color = "grey") +
+  geom_jitter(aes(color = self_reported_ethnicity), alpha = 1) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts of non-infected samples", 
+       subtitle = "batch2 only") +
+  scale_color_viridis_d(end = 0.5) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0,15))
+```
+
+The two groups are the different ancestries. Their response is ancestry dependent. 
+
+I wonder if the NI for batch 2 are actually Mtb and vice-versa. 
+
+What does the expression pattern for Mtb look like? 
+```{r fig.width= 12, fig.height=6}
+#convert voom table to long format and add metadata and convert gene_id to symbol (I did this above previously in a clearer way).
+top_v_ni <- v_ancestry_NI$E %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>%
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+top_v_mtb <- v_ancestry_Mtb$E %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>%
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+top_v_both <- bind_rows(top_v_ni, top_v_mtb)
+
+#select the genes we care about:
+top_v_both <- filter(top_v_both, symbol %in% c("TNF", "IL6", "IL1B", "MKI67")) 
+
+top_v_both_2 <- dplyr::filter(top_v_both, batch == "batch2")
+
+ggplot(top_v_both_2, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(), alpha = 0.5, outlier.size = 0, color = "grey") +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts", 
+       subtitle = "batch2 only") +
+  scale_color_manual(values = c("black", "blue")) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0,15))
+
+top_v_both_1<- dplyr::filter(top_v_both, batch == "batch1")
+
+ggplot(top_v_both_1, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(), alpha = 0.5, outlier.size = 0, color = "grey") +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts", 
+       subtitle = "batch1 only") +
+  scale_color_manual(values = c("black", "red")) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0,15))
+```
+
+Batch2 Mtb is higher response than NI, but the pattern is similar. When contrasted against batch1 it is very clear that batch2 NI is responding to something. Also it is very clear that the samples were not mixed up. Let's see how Mtb compares between batch 1 and 2. 
+
+```{r, fig.width= 12, fig.height=6}
+top_v_mtb <- filter(top_v_mtb, symbol %in% c("TNF", "IL6", "IL1B", "MKI67")) 
+
+#combined
+ggplot(top_v_mtb, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(), alpha = 0.5, outlier.size = 0, color = "grey") +
+  geom_jitter(aes(color = batch), alpha = 1) +
+  facet_wrap(~symbol, ncol = 4, scales = "free") +
+  labs(title = "voom normalized counts of Mtb-infected samples", 
+       subtitle = "batch1 only") +
+  scale_color_manual(values = c("red", "dodgerblue")) +
+  theme_bw() +
+  coord_cartesian(ylim = c(0,15))
+```
+
+
+For Mtb samples, Batch 2 is slightly more elevated than Batch 1, but displays a similar behavior. 
+
+Next step is to figure out if the response in NI is Mtb or something else. We can indirectly ask this by comparing the correlation of betas for each gene between batch1-batch2 NI effects and Mtb-NI batch1 effects. 
+
+### Is NI response Mtb?
+
+For this I need to remodel the infection effects with only batch1 and looks at just global effects. Then I will make a corr plot with infection beta from that model and the beta of batch from the ancestry_NI model here. 
+
+Remodel:
+```{r}
+#subset by batch1
+sample_info_batch1 <- dplyr::filter(sample_info, batch == "batch1")
+cts_batch1 <- cts[, row.names(sample_info_batch1)]
+
+#refactor donor_id and flow_cell
+sample_info_batch1$Donor_ID <- factor(as.character(sample_info_batch1$Donor_ID))
+sample_info_batch1$flow_cell <- factor(as.character(sample_info_batch1$flow_cell))
+
+#set design for global effects
+design_infection <- model.matrix(~ Infection + Timepoint + Donor_ID + flow_cell + perc_GC + perc_Dups + perc_Aligned, data = sample_info_batch1)
+
+#Check that design and cts match
+all(rownames(design_infection) == colnames(cts_batch1))
+
+#Voom transform - this was done above but repeat again to ensure the object is what we think it is
+v_infection <- DGEList(cts_batch1) %>% calcNormFactors() %>% voom(design_infection)
+
+#Fit to models
+vfit_infection <- lmFit(v_infection, design_infection) %>% eBayes()
+```
+
+
+Plot:
+```{r, fig.width= 5, fig.height=5}
+#get coefs:
+true_effects <- vfit_infection$coefficients[, "InfectionMtb"] %>% as.data.frame()
+batch_effects <- vfit_ancestry_NI$coefficients[, "batchbatch2"] %>% as.data.frame()
+
+#does row order match? Yes.
+all(rownames(true_effects) == rownames(batch_effects))
+
+#calculate corr. Rho = 0.4227711 
+cor.test(true_effects$., batch_effects$., method = "spearman")
+
+#plot simple
+plot(true_effects$., batch_effects$.)
+```
+
+They are pretty correlated. Not perfect, but the corr is 0.42, which is somewhat high. I don't know if this indicates it is a immune response generally or if it is a Mtb-specific response. 
+
+Make a ggplot:
+```{r, fig.width= 5, fig.height=5}
+colnames(true_effects) <- "infection_effects"
+colnames(batch_effects) <- "batch_effects"
+
+effects <- bind_cols(true_effects, batch_effects)
+
+ggplot(effects, aes(x = infection_effects, y = batch_effects)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") + 
+  theme_bw()+
+  coord_equal()
+
+ggplot(effects, aes(x = infection_effects, y = batch_effects)) +
+  geom_bin_2d(binwidth = 0.1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") + 
+  scale_fill_viridis_c() +
+  theme_bw() +
+  coord_equal()
+```
+
+The same conclusion holds, they correlate, but whether it is TB-specific or just a general response is unclear. To me, and I am only speculating here, I think it indicates a more general response and the culprit is likely something else. 
+
+One thing to try is looking at the fastq files to see if they have any overrepresented sequences. I just looked and there was nothing that mapped to the microbial genomes. This makes sense since the libraries were polyA selected. 
+
+
+## Is the batch2 response correlate with batch1 response?
+If they correlate, we could potentially use this data for response eQTLs. Let's see by moedling each batch seperately. 
+
+Separate batches:
+```{r}
+sample_info_batch1 <- dplyr::filter(sample_info, batch == "batch1")
+sample_info_batch2 <- dplyr::filter(sample_info, batch == "batch2")
+
+#do this to remove extra levels
+sample_info_batch1$flow_cell <- factor(as.character(sample_info_batch1$flow_cell))
+sample_info_batch2$flow_cell <- factor(as.character(sample_info_batch2$flow_cell))
+sample_info_batch1$Donor_ID <- factor(as.character(sample_info_batch1$Donor_ID))
+sample_info_batch2$Donor_ID <- factor(as.character(sample_info_batch2$Donor_ID))
+```
+
+Look at what values need to be removed/filled in with Heatmap:
+
+Batch1
+```{r}
+si_subset <- dplyr::select(sample_info_batch1, Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black"), legend.position = "none") +
+  ggsci::scale_fill_npg(alpha = 0.5)
+```
+
+Batch2
+```{r}
+si_subset <- dplyr::select(sample_info_batch2, Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black"), legend.position = "none") +
+  ggsci::scale_fill_npg(alpha = 0.5)
+```
+
+Great, it is perfect to split this way. Nothing needs to be removed or added. 
+
+Model!
+```{r}
+#split counts
+cts_batch1 <- cts[, row.names(sample_info_batch1)]
+cts_batch2 <- cts[, row.names(sample_info_batch2)]
+
+#Set designs for each model. Ancestry is condition-specific. 
+design_infection_batch1 <- model.matrix(~ Timepoint:Infection + Timepoint + Donor_ID + flow_cell + perc_GC + perc_Dups + perc_Aligned, data = sample_info_batch1)
+design_infection_batch2 <- model.matrix(~ Timepoint:Infection + Timepoint + Donor_ID + flow_cell + perc_GC + perc_Dups + perc_Aligned, data = sample_info_batch2)
+
+#Check that design and cts match
+all(rownames(design_infection_batch1) == colnames(cts_batch1))
+all(rownames(design_infection_batch2) == colnames(cts_batch2))
+
+#Voom transform - this was done above but repeat again to ensure the object is what we think it is
+v_infection_batch1 <- DGEList(cts_batch1) %>% calcNormFactors() %>% voom(design_infection_batch1)
+v_infection_batch2 <- DGEList(cts_batch2) %>% calcNormFactors() %>% voom(design_infection_batch2)
+
+#Fit to models
+vfit_infection_batch1 <- lmFit(v_infection_batch1, design_infection_batch1) %>% eBayes()
+vfit_infection_batch2 <- lmFit(v_infection_batch2, design_infection_batch2) %>% eBayes()
+```
+
+Get betas for each timepoint:
+```{r}
+batch1_betas <- vfit_infection_batch1$coefficients[, 28:37]
+batch2_betas <- vfit_infection_batch2$coefficients[, 30:39]
+```
+
+Plot correlation and compute:
+```{r, fig.width= 5, fig.height=5}
+plot(batch1_betas, batch2_betas)
+abline(a = 0, b = 1, lty = "dashed")
+cor.test(batch1_betas, batch2_betas, method = "pearson")
+cor.test(batch1_betas, batch2_betas, method = "spearman")
+```
+
+They correlate, not perfectly, but decently. Rho is 0.73 and pearson is 0.79. 
+
+I can make a better plot. 
+
+```{r, fig.width= 5, fig.height=5}
+batch1_betas <- batch1_betas %>% as.data.frame() %>% rownames_to_column("gene_id") %>% pivot_longer(cols = -gene_id, names_to = "timepoint", values_to = "batch1_betas")
+batch2_betas <- batch2_betas %>% as.data.frame() %>% rownames_to_column("gene_id") %>% pivot_longer(cols = -gene_id, names_to = "timepoint", values_to = "batch2_betas")
+
+betas <- inner_join(batch1_betas, batch2_betas, by = c("gene_id", "timepoint"))
+
+ggplot(betas, aes(x = batch1_betas, y = batch2_betas)) +
+  geom_point(alpha = 0.5, color = "firebrick") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") + 
+  theme_bw()+
+  coord_equal()
+
+ggplot(betas, aes(x = batch1_betas, y = batch2_betas)) +
+  geom_bin_2d(binwidth = 0.1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") + 
+  scale_fill_viridis_c(trans = "log10") +
+  theme_bw() +
+  coord_equal()
+```
+
+They correlate, so maybe we can use it to call response eQTLs?
+
+To see if this is possible, try calling popDRs. 
+
+## PopDRs between batch1 and batch2
+
+Model!
+```{r}
+#Set designs for each model. Ancestry is condition-specific. 
+design_popDR_batch1 <- model.matrix(~ 0 + Timepoint:African_admixture*Infection + Timepoint:Infection + Donor_ID + Timepoint + flow_cell + perc_GC + perc_Dups + perc_Aligned, data = sample_info_batch1)[,-(38)]
+design_popDR_batch2 <- model.matrix(~ 0 + Timepoint:African_admixture*Infection + Timepoint:Infection + Donor_ID + Timepoint + flow_cell + perc_GC + perc_Dups + perc_Aligned, data = sample_info_batch2)[,-(40)]
+
+#Check that design and cts match
+all(rownames(design_popDR_batch1) == colnames(cts_batch1))
+all(rownames(design_popDR_batch2) == colnames(cts_batch2))
+
+#Voom transform - this was done above but repeat again to ensure the object is what we think it is
+v_popDR_batch1 <- DGEList(cts_batch1) %>% calcNormFactors() %>% voom(design_popDR_batch1)
+v_popDR_batch2 <- DGEList(cts_batch2) %>% calcNormFactors() %>% voom(design_popDR_batch2)
+
+#Fit to models
+vfit_popDR_batch1 <- lmFit(v_popDR_batch1, design_popDR_batch1) %>% eBayes()
+vfit_popDR_batch2 <- lmFit(v_popDR_batch2, design_popDR_batch2) %>% eBayes()
+```
+
+Is the model working properly?
+```{r, fig.width= 10, fig.height=3}
+res <- topTable(vfit_popDR_batch1, coef = "TimepointT48:African_admixture:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T48")
+
+ggplot(top_v, aes(x = Infection, y = voom_cts, color = self_reported_ethnicity, fill = self_reported_ethnicity)) +
+  geom_boxplot(alpha = 0.5, color = "black") +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_fill_manual(values = c("darkorange", "darkblue")) +
+  scale_color_manual(values = c("darkorange", "darkblue")) +
+  ggtitle("batch1") +
+  theme_bw()
+```
+```{r, fig.width= 10, fig.height=3}
+res <- topTable(vfit_popDR_batch2, coef = "TimepointT48:African_admixture:InfectionMtb", number = 3)
+top_v <- v$E[row.names(res), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == "T48")
+
+ggplot(top_v, aes(x = Infection, y = voom_cts, color = self_reported_ethnicity, fill = self_reported_ethnicity)) +
+  geom_boxplot(alpha = 0.5, color = "black") +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_fill_manual(values = c("darkorange", "darkblue")) +
+  scale_color_manual(values = c("darkorange", "darkblue")) +
+  ggtitle("batch1") +
+  theme_bw()
+```
+
+They seem to capture the interaction effect. Although batch2 has pretty mild differences. Let's see the nmumber of popDRs overtime. 
+
+Get # of popDRs per timepoint:
+```{r}
+timepoint_list <- list()
+for (t in c(1,3,5,8,12,18,24,30,36,48)) {
+  timepoint_list <- append(timepoint_list, paste0("TimepointT", t, ":African_admixture:InfectionMtb"))
+}
+
+for (i in timepoint_list){
+  print(i)
+  topTable(vfit_popDR_batch1, coef = i, p.value = 0.1, number = Inf) %>% nrow() %>% print()
+  print("")
+}
+```
+```{r}
+batch1_numbers <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48")), 
+                          number_DEGs = c(0, 51, 11, 3, 194, 5, 382, 1932, 1894, 1922)) %>% mutate(batch = "batch1")
+```
+
+
+```{r}
+timepoint_list <- list()
+for (t in c(1,3,5,8,12,18,24,30,36,48)) {
+  timepoint_list <- append(timepoint_list, paste0("TimepointT", t, ":African_admixture:InfectionMtb"))
+}
+
+for (i in timepoint_list){
+  print(i)
+  topTable(vfit_popDR_batch2, coef = i, p.value = 0.1, number = Inf) %>% nrow() %>% print()
+  print("")
+}
+```
+
+Plot
+```{r}
+batch2_numbers <- data.frame(Time = factor(x = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"), levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48")), 
+                          number_DEGs = c(55, 1738, 593, 887, 957, 1585, 2084, 920, 400, 223)) %>% mutate(batch = "batch2")
+
+numbers <- bind_rows(batch1_numbers, batch2_numbers)
+
+popdrs_plot <- ggplot(numbers, aes(x = Time, y = number_DEGs, color = batch, group = batch)) +
+  geom_line() +
+  geom_point(size = 3) +
+  labs(y = "Number of PopDRs", x  ="Timepoint",
+       title = "Number of PopDRs for each batch over time", 
+       subtitle = "Thresholds: BH-adjusted pvalue < 0.1") +
+  scale_color_manual(values = c("red", "blue")) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"))
+
+popdrs_plot
+```
+
+The trends do not match. The final question is whether they are similar. i.e what is the % union batch1 and 2 at timepoints T24, T30, T36, T48. 
+
+
+```{r}
+# Initialize an empty data frame with the appropriate number of rows
+df_tmp <- data.frame(matrix(NA, nrow = 3, ncol = length(timepoint_list)))
+colnames(df_tmp) <- timepoint_list
+rownames(df_tmp) <- c("batch1", "batch2", "union")
+
+# Loop over timepoint_list
+for (i in timepoint_list) {
+  # Retrieve data for batch1
+  tmp1 <- topTable(vfit_popDR_batch1, coef = i, p.value = 0.1, number = Inf) %>%
+    rownames_to_column("gene_id")
+  
+  # Retrieve data for batch2
+  tmp2 <- topTable(vfit_popDR_batch2, coef = i, p.value = 0.1, number = Inf) %>%
+    rownames_to_column("gene_id")
+  
+  # Calculate number of rows for each batch and join
+  nrow_tmp1 <- nrow(tmp1)
+  nrow_tmp2 <- nrow(tmp2)
+  nrow_inner_join <- inner_join(tmp1, tmp2, by = "gene_id") %>% nrow()
+  
+  # Add the values to df_tmp
+  df_tmp[, i] <- c(nrow_tmp1, nrow_tmp2, nrow_inner_join)
+  
+  # Clean up
+  rm(tmp1, tmp2)
+}
+
+df_tmp <- t(df_tmp)
+
+df_tmp
+```
+ 
+ It looks like later timepoints are more similar, but still ~50% or less. This is pretty much the final nail in the coffin of this batch2 data for me. 
+ 
+ Luis wants to look at one more thing. Look at pairwise correlation of betas between the two batches across timepoints. 
+```{r, fig.width= 5, fig.height=5}
+batch1_betas <- vfit_popDR_batch1$coefficients[,47:56]
+colnames(batch1_betas) <- c("T1_batch1", "T3_batch1", "T5_batch1", "T8_batch1", "T12_batch1", "T18_batch1", "T24_batch1", "T30_batch1", "T36_batch1", "T48_batch1")
+batch2_betas <- vfit_popDR_batch2$coefficients[,49:58]
+colnames(batch2_betas) <- c("T1_batch2", "T3_batch2", "T5_batch2", "T8_batch2", "T12_batch2", "T18_batch2", "T24_batch2", "T30_batch2", "T36_batch2", "T48_batch2")
+correlation_matrix <- cor(batch1_betas, batch2_betas)
+
+pheatmap::pheatmap(correlation_matrix,
+         cluster_rows = F, # No clustering of rows
+         cluster_cols = F, # No clustering of columns
+         main = "Pairwise Correlation of PopDR betas between batches",
+         scale = "none", 
+         color = colorRampPalette(c("blue", "white", "red"))(100), 
+         border_color = NA, 
+         fontsize = 8, 
+         cellwidth = 20,
+         cellheight = 20, 
+         show_colnames = TRUE,
+         show_rownames = TRUE)
+```
+
+Seems like the T18-48 in batch 1 is most similar to T1 in batch2.
+
+## Conclusions:
+
+It appears that the non-infected samples in batch 2 were all somewhat stimulated prior to data collection. But for the Ancestry trends directly above, the Mtb samples matched between batch 1 and 2. On the other hand, NI did not match at all and displayed signatures of an immune response, although a moderately less robust one compared to the Mtb samples. 
+
+I will discuss with the group, but I see two ways forward. 
+
+1) Toss all of the batch 2 data and use only the batch 1 samples. 
+2) Toss only the NI samples for batch 2 and somehow devise a method to use the Mtb samples with the caveat that they were likely stimulated by something before the Mtb infections. 
+
+Honestly, option 1 is the best way forward, but a sad one. 
+
+I will explore modeling using Batch1 only in a seperate notebook. 
+
+After discussion at my lab meeting, we decided that option 1 is the way to go. We will not include any of the batch2 data in the paper. 

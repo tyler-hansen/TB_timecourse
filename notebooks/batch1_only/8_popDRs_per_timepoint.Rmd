@@ -1,0 +1,710 @@
+---
+title: "Linear modeling of RNA-seq data with Limma-Voom: popDRs"
+output: html_notebook
+---
+Author: Tyler Hansen
+Date: 6.28.2024
+
+I previously modeled the ancestry effect at each timepoint and condition. Now I want to identify how Ancestry impacts the response to infection.
+
+Analyses done here will likely make up figure 4 (popDRs). 
+
+## Setup
+
+Packages
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+```
+
+Three tables
+```{r}
+#read in GTF
+gtf <- rtracklayer::readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+
+#read in cts
+cts <- readRDS("data/filtered_counts_final_batch1.rds")
+
+#read in si
+sample_info <- readRDS("data/metadata_final_batch1.rds")
+```
+
+## Model Ancestry:
+
+
+
+Model: ~ Infection:African_admixture:Timepoint + Infection:Timepoint + African_admixture:Timepoint + Timepoint + Donor_ID + technical confounders[RNA_concentration + perc_Dups + flow_cell + M_Aligned]
+
+Set up design
+```{r}
+design <- model.matrix(~ Timepoint + Infection:Timepoint + African_admixture:Timepoint + Infection:African_admixture:Timepoint + Donor_ID + flow_cell + RNA_concentration + perc_Dups + M_Aligned, data = sample_info)
+
+#remove unestimable coef
+design <- design[, !colnames(design) %in% "TimepointT48:African_admixture"]
+```
+
+Voom transform counts
+```{r}
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+v <- voom(dge, design, plot = T)
+```
+
+Fit and calc stats
+```{r}
+vfit <- lmFit(v, design)
+vfit <- eBayes(vfit)
+```
+
+### Plot residual variance vs. expression SA plot
+
+```{r}
+plotSA(vfit)
+```
+
+Sigma is the estimated residual standard deviation, so the variance is no longer dependent on the mean expression level. This is good.
+
+###Check model is behaving as expected:
+
+Set up list of coefficient terms
+```{r}
+#set timepoints
+timepoints <- c("T1","T2","T3","T4","T5","T6","T7","T8","T9","T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")
+
+#get list of terms for infection
+beta_list <- list()
+for (t in timepoints) {
+  beta <- paste0("Timepoint", t, ":InfectionMtb:African_admixture")
+  beta_list <- append(beta_list, beta)
+  rm(beta)
+}
+```
+
+For each coefficient, get the top 6 genes using top table and plot voom counts
+```{r, fig.width = 12, fig.height=8}
+for (i in beta_list) {
+    #get top hits
+  tmp <- topTable(vfit, coef = i, number = 6)
+  
+  #make df of voom counts for each gene and each condition. 
+  tmp <- v$E[row.names(tmp), ] %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "sample", values_to = "voom_cts") %>% 
+    left_join(rownames_to_column(sample_info, var = "sample"), by = "sample") %>% 
+    mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% dplyr::filter(Timepoint == str_extract(i, "(?<=Timepoint)T\\d+"))
+  
+  #plot
+  p <- ggplot(tmp, aes(x = ethnicity, y = voom_cts, fill = Infection, color = ethnicity)) +
+  geom_boxplot(alpha = 0.5, outliers = F) +
+  facet_wrap(~symbol, ncol = 3, scales = "free") +
+  scale_fill_manual(values = c("grey", "red")) +
+  scale_color_manual(values = c("black", "grey50")) +
+  ggtitle(paste0("Top 6 genes for ", i, " coefficient")) +
+  theme_bw()
+  
+  print(p)
+  
+  #save plot
+  pdf(file = paste0("results/batch1_only/popDRs/top_genes_boxplots/", str_extract(i, "(?<=Timepoint)T\\d+"), ".pdf"), height = 8, width = 12, family = "ArialMT")
+  print(p)
+  dev.off()
+}
+```
+
+
+Looks right. Now get qvalues. 
+
+### Compute emperical p values and apply the story fdr correction to these values
+
+#### Permute the variable of interest and calculate the null pvalues, for at least 200 iterations. 
+Permute the the ancestry column within infection so that ancestry is randomly distributed within each infection column and the null is the random effect of that. 
+```{r}
+#function to permute the variable of interest
+permute_si_variable_within_category <- function(var, si, cat, n = 200) {
+  # var is the variable of interest
+  # si is the sample info/metadata
+  # cat is the category/variable to permute within (must be a factor)
+  # n is the number of iterations
+  # this function returns a list of permuted sample info data.frames 
+  
+  # create dummy list
+  list_x <- list()
+  
+  #split the si into the individual factors of the cat and permute var
+  for (category in levels(si[,cat])) {
+    #split si
+    x <- si[si[,cat] == category, ]
+    
+    #permute
+    x <- rsample::permutations(x, permute = all_of(var), times = n)
+    
+    #add to list
+    list_x[[category]] <- x
+  }
+
+  #for each iteration, extract permutations for each timepoint and join back together
+  
+  #make another dummy list
+  list_y <- list()
+  
+  for (i in seq(1, n)) {
+    #make dummy df 
+    df <- data.frame()
+    
+    for (category in levels(si[,cat])) {
+        x <- list_x[[category]] 
+        x <- x$splits[[i]] %>% rsample::analysis() %>% as.data.frame()
+        df <- rbind(df, x)
+    }
+    
+    #add df to list
+    list_y[[i]] <- df
+  }
+  #return the list
+  return(list_y)
+}
+```
+
+```{r}
+#set seed so random generation is reproducible
+set.seed(1993)
+
+#execute function:
+permuted_si <- permute_si_variable_within_category(var = "African_admixture", si = sample_info, cat = "Infection", n = 200)
+```
+
+#### Fit permuted data to linear models, use the same model as done in the observed analysis
+```{r}
+fit_permutations <- function(perms, formula, v) {
+  # perms is the permuted sample info
+  # formula is the formula used in the respective analysis provided in quotes (ex: "~ Timepoint")
+  # v are the voom tramsformed counts to input into the random/null models. 
+  # Returns a list of model fits for the permuted data
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+    for (i in seq(1, length(perms))) {
+      message(i)
+      #set up model for ith iteration
+      m_rand <- model.matrix(as.formula(formula), data = as.data.frame(perms[i]))
+    
+      #fit model for each iteration
+      vfit_rand <- lmFit(v, m_rand)
+      
+      #compute stats
+      vfit_rand <- eBayes(vfit_rand)
+      
+      #add to list
+      list_x <- rlist::list.append(list_x, vfit_rand)
+    }
+  return(list_x)
+}
+```
+
+```{r}
+permuted_fits <- fit_permutations(perms = permuted_si, formula = "~ Timepoint + Infection:Timepoint + African_admixture:Timepoint + Infection:African_admixture:Timepoint + Donor_ID + flow_cell + RNA_concentration + perc_Dups + M_Aligned", v = v)
+```
+
+#### Calculate null pvalues
+```{r}
+get_null_pvals <- function(perm_fits) {
+  # perm_fits is the list of model fits for permuted data 
+  # cat is the category/variable that was permuted within (must be a factor). This is used to identify the individual categories to get pvalues for. 
+  # Returns a vector of pvalues for the contrast between Mtb and NI
+  
+  # create dummy df
+  df <- data.frame()
+  
+  #for each iteration, extract the null pvalues between NI and Mtb:
+    for (i in seq(1, length(perm_fits))) {
+      message(i)
+      #for each iteration, append p.vals to the dummy df
+      x <- as.data.frame(perm_fits[[i]]$p.value)
+      df <- dplyr::bind_rows(df, x)
+    }
+  return(df)
+}
+```
+
+Get null pvals
+```{r}
+null_pvalues <- get_null_pvals(permuted_fits)
+```
+
+#### Check the distribution of null pvalues
+```{r}
+hist(as.matrix(null_pvalues)[, 75:93])
+hist(vfit$p.value[, 73:92]) # we removed a col at the very begeinning because it was not estimable. 
+```
+
+#### Remove TimepointT48:African_admixture from nulls
+```{r}
+null_pvalues <- as.matrix(null_pvalues)[,-c(74)]
+```
+
+For each timepoint, calculate p-values from a set of observed test statistics and simulated null test statistics. 
+
+Note: the the pvals are -log10 transformed so that stat(obs) is greater than stat0(null)
+
+```{r}
+#make pval and se dfs
+obs_pvals <- as.data.frame(vfit$p.value)
+
+#setup results list
+popDR_results <- list()
+
+#run through list to extract qvalues for each
+for (i in beta_list) {
+  emperical_pvals <- qvalue::empPvals(stat = -log10(obs_pvals[, i]), stat0 = -log10(null_pvalues[, i]), pool = T)
+  qvals <- qvalue::qvalue(p = emperical_pvals)
+  
+  #merge
+  tmp1 <- data.frame(obs_pval = obs_pvals[, i], empirical_pval = emperical_pvals, qval = qvals$qvalues)
+  
+  #get pvalues just for the timepoint
+  tmp2 <- dplyr::select(obs_pvals, all_of(i))
+  colnames(tmp2) <- "p.value"
+  
+  #join to each gene
+  tmp3 <- bind_cols(tmp2, tmp1) %>% rownames_to_column("gene_id")
+  
+  #stop if the row order is not the same
+  if (all(tmp3$p.value == tmp3$obs_pval) == FALSE) {
+    stop()
+  }
+  
+  #remove redundant col
+  tmp3 <- dplyr::select(tmp3, -p.value)
+  
+  #get the stats
+  tmp4 <- data.frame(coefficients = c(vfit$coefficients[, i]), 
+                     t_statistic = c(vfit$t[, i]), 
+                     p.value = c(vfit$p.value[, i])) %>% rownames_to_column("gene_id")
+  
+  #join
+  tmp5 <- inner_join(tmp4, tmp3, by = "gene_id")
+  
+  #stop if join doesn't work properly
+  if (all(tmp5$p.value == tmp5$obs_pval) == FALSE) {
+    stop()
+  }
+  #remove redundant col 
+  tmp5 <- dplyr::select(tmp5, -obs_pval)
+
+  #append
+  popDR_results[[i]] <- tmp5
+  
+  #remove tmps
+  rm(tmp1, tmp2, tmp3, tmp4, tmp5)
+}
+```
+
+#### Save results
+```{r}
+saveRDS(popDR_results, file = "results/batch1_only/popDRs/popDR_results.RDS")
+```
+
+
+### Number of popDRs per timepoint
+Now that we have emprical qvalues, we will threshold with qval.
+
+We will threshold with qval and effect size.
+
+Plot distributions to make an educated choice on the thresholds. 
+
+qvalues
+```{r}
+#get all qvalues
+tmp <- data.frame(dummy=1:11181)
+for (i in beta_list) {
+tmp[[i]] <- popDR_results[[i]]$qval %>% as.numeric()
+}
+tmp <- tmp[,-1] %>% as.matrix()
+hist(tmp, breaks = 100)
+abline(v = c(0.05))
+rm(tmp)
+```
+
+Probably 0.05 is the best q val threshold. 
+
+effect sizes
+```{r}
+#get all qvalues
+tmp <- data.frame(dummy=1:11181)
+for (i in beta_list) {
+tmp[[i]] <- popDR_results[[i]]$coefficients %>% as.numeric()
+}
+tmp <- tmp[,-1] %>% as.matrix()
+hist(tmp, breaks = 100)
+abline(v = c(-0.5, +0.5))
+rm(tmp)
+```
+
+Use log2fc +/- 0.5. This is equivalent to a fold change of 1.4 or 40% difference between Afr and Eur ancestries.
+
+Report number of popDEs using qval < 0.05. 
+```{r}
+#setup df
+popDRs_df <- data.frame()
+
+#loop through results
+for (i in beta_list) {
+timepoint <- str_extract(i, "(?<=TimepointT)\\d+") %>% as.numeric()
+popDRs <- dplyr::filter(popDR_results[[i]], qval < 0.05 & abs(coefficients) > 0.5) %>% nrow()
+tmp <- data.frame(timepoint = timepoint, "num_popDRs" = popDRs)
+popDRs_df <- rbind(popDRs_df, tmp)
+rm(tmp, timepoint, popDRs)
+}
+```
+
+Plot
+```{r, fig.width=5.5, fig.height=4}
+popDRs_plot <- ggplot(popDRs_df, aes(x = timepoint, y = num_popDRs, group = 1)) +
+  geom_smooth(color = "orange") +
+  geom_line(linetype = "dashed",) +
+  geom_point(size = 3) +
+  #geom_text(aes(label = number_DEGs), vjust = 0, hjust=-0.2, angle = 75) +
+  scale_x_continuous(breaks = seq(0,48,4)) +
+  scale_y_continuous(breaks = seq(0,6e3, 1000)) +
+  labs(y = "Number of popDRs", x  ="Timepoint (hrs)",
+       title = "Number of popDRs over time", 
+       subtitle = "Thresholds: q-value < 0.05 & |Log2FC| > 0.5") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 10), plot.subtitle = element_text(hjust = 0.5, face = "italic", size = 8))
+
+popDRs_plot 
+
+pdf(file = "results/batch1_only/popDRs/popDRs_perTimepoint.pdf", height = 4, width = 5.5, family = "ArialMT")
+popDRs_plot
+dev.off()
+```
+
+There's quite a degree of variance between timepoints, but the later timepoints are where the popDRs are. 
+
+
+## Gene Set Enrichment Analysis
+
+Using the t stat for each gene, run GSEA for T18-T48 against hallmark pathways. 
+
+Loop through the specified condition/timepoints. To do this set up a list to iterate through
+```{r}
+#setup lists of coefs to iterate through
+enrich_list <- list()
+for (t in c("T18","T24","T30","T36","T42","T48")) {
+  time <- paste0("Timepoint", t, ":InfectionMtb:African_admixture")
+  enrich_list <- append(enrich_list, time)
+  rm(time)
+}
+```
+
+Load hallmark pathways
+```{r}
+#load Human Molecular Signatures Database (msigdb) pathways
+hallmark_pathways <- fgsea::gmtPathways("../../common-use-files/msigdb_pathways/h.all.v2023.2.Hs.symbols.gmt")
+```
+
+```{r}
+#setup results list to append results to for each timepoint
+gsea_results_list <- list()
+
+for (i in enrich_list) {
+  #get timepoint
+  tmp0 <- str_extract(i, "(?<=TimepointT)\\d+") %>% as.numeric()
+  
+  #assign timepoint specific result to tmp1
+  tmp1 <- popDR_results[[i]]
+  
+  #rank by t stat
+  tmp2 <- dplyr::arrange(tmp1, t_statistic)
+  
+  #isolate symbol from gene_id - run distinct to make sure there are no duplicates
+  tmp3 <- mutate(tmp2, symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% distinct(symbol, .keep_all = T)
+  
+  #make rank vector
+  tmp4 <- tmp3$t_statistic
+  names(tmp4) <- tmp3$symbol
+  
+  #run fgsea for hallmark
+  tmp5 <- fgsea::fgsea(hallmark_pathways, tmp4, nproc = 1)
+  
+  #append to list
+  gsea_results_list[[as.character(tmp0)]] <- tmp5
+  
+  #remove vars
+  rm(tmp0, tmp1, tmp2, tmp3, tmp4, tmp5)
+}
+```
+
+Select pathways with padj < 0.001 and a NES > +/- 0.5 in at least one timepoint.
+```{r}
+#function
+select_top_pathways <- function(res, p, nes) {
+  sig <- as.data.frame(res) %>% dplyr::filter(padj < p & abs(NES) > nes)
+  return(sig)
+}
+
+#apply function to all of the elements of the list
+gsea_top_results_list <- lapply(gsea_results_list, FUN = select_top_pathways, p = 0.001, nes = 0.5)
+```
+
+Now that we have the top results. Get the pathway names for plotting. 
+```{r}
+#establish vector to append pathways to. 
+gsea_top_pathways <- c()
+
+#iterate through top results list getting pathway names and appending to vector. 
+for (i in c(18,24,30,36,42,48)) {
+  tmp <- gsea_top_results_list[[as.character(i)]]$pathway
+  gsea_top_pathways <- append(gsea_top_pathways, tmp)
+  rm(tmp)
+}
+
+#collapse duplicate pathway names and convert to df
+gsea_top_pathways <- unique(gsea_top_pathways) %>% as.data.frame()
+colnames(gsea_top_pathways) <- "pathway"
+```
+
+Now that we have top pathways, extract NES from each timepoint and put into a dataframe. 
+```{r}
+for (i in c(18,24,30,36,42,48)) {
+  #extract timepoint
+  res <- gsea_results_list[[as.character(i)]] %>% as.data.frame()
+  #intersect with top pathways
+  res <- inner_join(res, gsea_top_pathways, by = "pathway")
+  #parse if first time to add pathway
+  if (i == 18) {
+    gsea_top_results_NES_df <- dplyr::transmute(res, pathway, !!as.character(i) := NES)
+  }
+  if (i != 18) {
+  #add to a new column of df
+    res <- dplyr::transmute(res, pathway, !!as.character(i) := NES)
+    gsea_top_results_NES_df <- left_join(gsea_top_results_NES_df, res, by = "pathway")
+  }
+  rm(res)
+}
+```
+
+Order pathway by mean NES.
+```{r}
+gsea_top_results_NES_df <- mutate(gsea_top_results_NES_df, mean_NES = rowMeans(across(-1))) %>%
+  arrange(desc(mean_NES)) %>%
+  select(1, everything()) %>% dplyr::select(-mean_NES)
+```
+
+Remove "hallmark_" from each pathway.
+```{r}
+gsea_top_results_NES_df <- mutate(gsea_top_results_NES_df, pathway = str_remove(pathway, "HALLMARK_"))
+
+#specify levels of pathways
+gsea_top_results_NES_df$pathway <- factor(gsea_top_results_NES_df$pathway, levels = rev(c(gsea_top_results_NES_df$pathway)))
+```
+
+Pivot longer so timepoint is a single column. 
+```{r}
+gsea_top_results_NES_df <- pivot_longer(gsea_top_results_NES_df, cols = 2:last_col(), names_to = "Timepoint", values_to = "NES")
+
+#specify levels of timepoint
+gsea_top_results_NES_df$Timepoint <- factor(gsea_top_results_NES_df$Timepoint, levels = c("18","24","30","36","42","48"))
+```
+
+Plot results as a heatmap with x=time, y=pathway, color=NES
+```{r, fig.width=8, fig.height=6}
+library(RColorBrewer)
+my_palette <- colorRampPalette(colors = c("forestgreen", "white", "goldenrod1"))(50)
+
+gsea_heatmap <- ggplot(gsea_top_results_NES_df, aes(x = Timepoint, y = pathway, fill = NES)) +
+  geom_tile(color = "white", lwd = 0.25) +
+  scale_fill_gradientn(colors = my_palette) +
+  labs(title = "Gene Set Enrichment Analysis of popDRs over later timepoints",
+       subtitle = "*only hallmark pathways with padj < 0.001 & NES +/-0.5\nfor at least one of the specified timepoints are shown",
+       x = "Time Post-Infection (hrs)", 
+       y = "Hallmark Pathways") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12), 
+        plot.subtitle = element_text(hjust = 0.5, face = "italic"), 
+        axis.text.x = element_text(angle = 90, hjust = 1)) +
+  coord_equal()
+
+
+gsea_heatmap
+
+#save
+pdf(file = "results/batch1_only/popDRs/popDR_GSEA_heatmap.pdf", height = 8, width = 6, family = "ArialMT")
+gsea_heatmap
+dev.off()
+```
+
+### Expr vs. time heatmaps of response for genes within each pathway
+
+Here are the pathways I want to explore:
+
+E2F_TARGETS
+MYC_TARGETS_V1
+MYC_TARGETS_V2
+G2M_CHECKPOINT
+DNA_REPAIR
+IL6_JAK_STAT3_SIGNALING
+COMPLEMENT
+INFLAMMATORY_RESPONSE
+INTERFERON_GAMMA_RESPONSE
+TNFA_SIGNALING_VIA_NFKB
+
+Look at select pathways:
+```{r}
+library(pheatmap)
+set.seed(1993)
+
+#Get counts
+pathway_list <- list("E2F_TARGETS",
+"MYC_TARGETS_V1",
+"MYC_TARGETS_V2",
+"G2M_CHECKPOINT",
+"DNA_REPAIR",
+"IL6_JAK_STAT3_SIGNALING",
+"COMPLEMENT",
+"INFLAMMATORY_RESPONSE",
+"INTERFERON_GAMMA_RESPONSE",
+"TNFA_SIGNALING_VIA_NFKB")
+```
+
+Since we plotted NES in the previous plot, we will have to pick something else to plot for this. I think we shoudl use the coefficients for each gene from the model. These betwe represent the L2FC of the ancestry effect. 
+
+Get the values prepared for plotting. We will want a matrix of the Mtb coefs with rows as all genes and columns as Timepoints T18-T48. 
+```{r}
+for (i in enrich_list) {
+  #assign timepoint/condition specific result to tmp1
+  tmp <- popDR_results[[i]] %>% as.data.frame()
+  
+  #isolate symbol from gene_id - run distinct to make sure there are no duplicates
+  tmp <- mutate(tmp, symbol = str_split_i(gene_id, pattern = "_", i = 2)) %>% distinct(symbol, .keep_all = T)
+  
+  #select symbol and coefficients columns
+  tmp <- dplyr::select(tmp, symbol, coefficients)
+  
+  #rename coef column as timepoint
+  colnames(tmp)[2] <- paste0("T", str_extract(i, "(?<=TimepointT)\\d+"))
+  
+  #parse to establish df for first iteration
+  if (i == "TimepointT18:InfectionMtb:African_admixture") {
+    coefs_df <- tmp
+  }
+  if (i != "TimepointT18:InfectionMtb:African_admixture") {
+    #add to a new column to initialized df
+    coefs_df <- left_join(coefs_df, tmp, by = "symbol")
+  }
+  rm(tmp)
+}
+
+#convert to matrix
+coefs_matrix <- column_to_rownames(coefs_df, "symbol") %>% as.matrix()
+```
+
+
+Okay next intersect with genes for each pathway and plot with pheatmap. 
+
+```{r, fig.height=6, fig.width=25}
+for (i in pathway_list) {
+  #print iteration
+  print(i)
+  
+  #Get gene symbols from hallmark pathways object
+  tmp <- hallmark_pathways[[paste0("HALLMARK_", i)]]
+  
+  #some genes are not present in coefs matrix due to filtering, remove these
+  tmp <- tmp[tmp %in% rownames(coefs_matrix)]
+  
+  #intersect with pathway genes
+  tmp <- coefs_matrix[tmp,]
+  
+  #flip axis
+  tmp <- t(tmp)
+  
+  #set color scate by getting min, max, and mid values 
+  min_val <- -2.5
+  max_val <- 2.5
+  
+  # Generate breaks with the midpoint at 0
+  breaks <- c(seq(min_val, max_val, length.out=51))
+  
+  #plot
+  tmp <- pheatmap(tmp, cluster_rows = F, cluster_cols = T, color = my_palette, scale = "none", breaks = breaks, main=i)
+  
+  #save
+  pdf(file = paste0("results/batch1_only/popDRs/popDR_hallmary_pathway_heatmaps/popDE_", i, ".pdf"), width = 25, height = 6, family = "ArialMT")
+  print(tmp)
+  dev.off()
+}
+```
+
+
+This is cool. Next plot behavior of genes over time. 
+
+Notable genes from the heat map that were not previously analyzed in popDEs:
+
+CSF1
+IL1A
+IL1B
+CCL7
+
+### Gene-by-gene analysis of expression over time
+
+Get counts: convert voom counts 
+```{r}
+v_counts_symbol <- v$E %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  mutate(gene_id = str_split_i(gene_id, pattern = "_", i = 2)) %>% 
+  dplyr::distinct(gene_id, .keep_all = T) %>% 
+  column_to_rownames(var = "gene_id")
+```
+
+Set list of genes to analyze. 
+```{r}
+analysis_genes <- list("CSF1",
+"IL1A",
+"IL1B",
+"CCL7")
+```
+
+
+Loop through list of genes producing a plot of expression over time with values for each condition and ancestry plotted separately.
+```{r, fig.width=8, fig.height=4}
+for (i in analysis_genes) {
+
+tmp1 <- v_counts_symbol[i,] %>% as.data.frame() %>% rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "sample", values_to = "counts") %>% 
+  left_join(rownames_to_column(sample_info, var = "sample"), by = "sample")
+
+tmp2 <- ggplot(tmp1, aes(x = Timepoint, y = counts, color = Infection, fill = ethnicity)) +
+  geom_boxplot(outliers = F, alpha = 0.8) +
+  scale_fill_manual(values = c("goldenrod1", "forestgreen")) +
+  scale_color_manual(values = c("grey", "black")) +
+  ylab("Log2 Expression") +
+  ggtitle(i) +
+  theme_bw()
+
+print(tmp2)
+
+pdf(file = paste0("results/batch1_only/popDRs/popDR_example_genes/", i, "_expr_vs_time.pdf"), width = 8, height = 4)
+print(tmp2)
+dev.off()
+
+rm(tmp1, tmp2)
+}
+```
+
+Again, some interesting behaviors here. 
+
+When we merge this with the behaviors we saw for the popDE genes, it is clear there are a few different types of genes. 
+
+1) There are popDE genes with no response effect - SMAD3. 
+2) There are popDR genes with a larger upregulation magnitude in one ancestry than the other - CCL7. 
+3) There are popDR genes with a larger down regulation in other - Cell Cycle genes (Ex. CDC45). 
+4) There are popDRs with more persistent expression in one ancestry - CD80. 
+5) There are popDRs that seemingly "fall of the table" in one ancestry, where NI and MTb are similar, but at later timepoints in Mtb for one ancestry, the gene becomes down regulated. Ex. HLA-DRB1. 
+
+and many more...
+
+The question I am struggling with is how can we discern these in a meaningful way? Is there there a clustering analysis we can do that separates them? I'm not sure. 
+
+For now, I think we should just use the figures we have and point to the 1-5 examples as example behaviors. 

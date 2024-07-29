@@ -1,0 +1,1790 @@
+---
+title: "Exploratory Data Analysis with Limma-Voom"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 11.19.2023 | Update 1.3.2024 | Update 1.22.2024 | Update 2.5.2024 | Update 2.29.2024 | Update 3.14.2024
+
+This notebook is about exploring the data and metadata to understand it. This will enable us to come up with a strategy of how to best analyze the data. The dataset here, is only a subset of the entire thing. Each donor has a Mtb and NI for each timepoint, so that there are no missing variables. We may decide late to impute these values or rather model using a different time variable, but this current approach is simple and will still enable key insights to be gleaned. 
+
+Both the metadata and counts matrix were made in separate notebooks: "generate_metadata_heatmaps.Rmd" and "prepare_counts_matrix.Rmd". In processing these, a few samples had to be duplicated, and those can be identified in thoses notebooks. Altogether we have 486 samples for 58051 genomic features. 
+
+I added covariates to the metadata and fixed some variables in "collect_covariates.Rmd". 
+
+### Packages
+```{r, echo=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+suppressPackageStartupMessages(library(GenomicFeatures))
+library(GenomicRanges)
+library(rtracklayer)
+suppressPackageStartupMessages(library(plyranges))
+```
+
+## Explore all data
+
+Before looking at the data subset that we are going to analyze (_filt), I am going to first read in and look at all of the samples (_all). 
+```{r}
+#read in sample info/metadata and sort alphabetically by filename
+sample_info_all <- read_tsv("results/metadata_with-covariates.tsv", col_names = T, show_col_types = F) %>% column_to_rownames("filename")
+
+#convert flow_cell to factor:
+sample_info_all$flow_cell <- factor(sample_info_all$flow_cell)
+
+#reorder timepoint levels:
+sample_info_all$Timepoint <- factor(sample_info_all$Timepoint, levels = c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48"))
+
+#set design matrix
+design_all <- model.matrix(~ 0 + Infection + Donor_ID + perc_GC + perc_Dups + perc_Aligned + flow_cell, data = sample_info_all)
+```
+
+### Read in and filter counts
+The general filtering strategy is the following: 
+
+Filter counts at three levels: 1) protein coding genes only; 2) samples from metadata table (some samples were removed) ; 3) remove low count data. 
+
+1) protein coding filter
+```{r}
+#read in cts (not the duplicates included one)
+cts_all <- read_tsv("data/kallisto.gene-level.lengthScaledTPM.tsv", show_col_types = F) 
+
+#read in GTF
+gtf_file <- "data/Homo_sapiens.GRCh38.87.gtf"
+gtf <- readGFFAsGRanges(gtf_file)
+
+#extract protein coding genes. I checked and this entire pipe works. 
+pc_gene_ids <- plyranges::filter(gtf, type == 'gene', gene_biotype == 'protein_coding') %>% as.data.frame() %>% dplyr::select(gene_id, gene_name)
+
+#join with counts to select protein coding genes.
+cts_1_all <- left_join(pc_gene_ids, cts_all, by = 'gene_id')
+
+#merge ensembl_id and gene name and set as to rownames. 
+cts_1_all <- unite(cts_1_all, "ID", gene_id:gene_name, sep = "_") %>% column_to_rownames(var = "ID")
+```
+
+2) samples from metadata table
+```{r}
+#filter samples from cts
+cts_2_all <- dplyr::select(cts_1_all, intersect(colnames(cts_1_all), row.names(sample_info_all))) 
+```
+
+3) remove low count data by voom-transformed row medians > 1.5
+```{r}
+#voom transform first
+dge_all <- DGEList(cts_2_all)
+dge_all <- calcNormFactors(dge_all)
+v_all <- voom(dge_all, design_all, plot = F)
+
+#filter genes based on voom-transformed row medians > 1.5. This is equivalent to 10^1.5 = 31.6 raw counts. This is much more stringent.  
+keep <- data.frame(genes = rownames(cts_2_all), medians = apply(v_all$E, 1, median), order = 1:nrow(cts_2_all))
+cts_3_all <- cts_2_all[which(keep$medians > 1.5), ]
+
+#report how much was lost
+print('total features remaining')
+nrow(cts_3_all)
+print('total features removed') 
+nrow(cts_2_all) - nrow(cts_3_all)
+```
+
+### Explore data 
+There are a few things we want to do before moving forward. 
+
+1) First we want to make sure the count distribution for each sample is roughly the same. 
+2) We also want to check that there are no NAs for any gene or samples. 
+
+#### Count distribution. 
+
+Lets look at cts_2 and cts_5 so we have an understanding of this before and after the low count filter. 
+```{r}
+df_2_all <- rownames_to_column(cts_2_all, "gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+
+df_3_all <- rownames_to_column(cts_3_all, "gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+
+ggplot(data=df_2_all, aes(x=log10(counts+1), group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+ggplot(data=df_3_all, aes(x=log10(counts+1), group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+They look good, except there is one that is off. Let's try to identify it. 
+
+```{r}
+medians <- apply(t(cts_2_all), 1, median) %>% as.data.frame()
+colnames(medians) <- "meds"
+
+medians <- arrange(medians, meds)
+
+head(medians)
+```
+```{r}
+df_2_all_sub <- dplyr::filter(df_2_all, Sample == "kallisto_14_EU144_T18_Mtb_MOI_5_run1")
+df_3_all_sub <- dplyr::filter(df_3_all, Sample == "kallisto_14_EU144_T18_Mtb_MOI_5_run1")
+
+ggplot(data=df_2_all_sub, aes(x=log10(counts+1), group=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+ggplot(data=df_3_all_sub, aes(x=log10(counts+1), group=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+Yep, it is this sample: kallisto_14_EU144_T18_Mtb_MOI_5_run1. See if this is fixed in the voom transformation. 
+
+#### Voom Count distribution. 
+Lets look at los count data filtered only here, since this is the data we will be using. 
+```{r}
+#voom transform first
+dge_all <- DGEList(cts_3_all)
+dge_all <- calcNormFactors(dge_all)
+v_all <- voom(dge_all, design_all, plot = F)
+
+df_v_all <- as.data.frame(v_all$E) %>% rownames_to_column("gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+
+ggplot(data=df_v_all, aes(x=counts, group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+Great, they are all nicely normalized and comparable across samples. This worked very well. There are a few genes in that one sample that are low, but the rest are high. Let's see if we can identify these genes. 
+
+```{r}
+df_v_all_sub <- dplyr::filter(df_v_all, Sample == "kallisto_14_EU144_T18_Mtb_MOI_5_run1", counts < -2)
+nrow(df_v_all_sub)
+```
+There are 302 genes in this pool that all have the same value. This tells me they had a count of 0 in this particular sample. Lets see when their expression is in the other samples so we can consider dropping them further. 
+
+```{r}
+dv_v_all_sub2 <- dplyr::filter(df_v_all, gene_id %in% df_v_all_sub$gene_id) %>% 
+  dplyr::filter(!Sample == "kallisto_14_EU144_T18_Mtb_MOI_5_run1") 
+
+ggplot(data=dv_v_all_sub2, aes(x=counts, group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+This means these genes are scattered throughout the distribution. Meaning they are not all just low count data, so we shouldn't throw them out. I wonder if we should consider throwing this sample out. 
+
+Let's go back to the untransformed count data for these genes and see their count in the sample. 
+
+```{r}
+cts_3_all_sub <- cts_3_all[df_v_all_sub$gene_id, "kallisto_14_EU144_T18_Mtb_MOI_5_run1"] %>% as.data.frame()
+summary(cts_3_all_sub)
+```
+Yeah, all zero counts except 2. I'm not sure how to handle this, except for removing the sample and duplicating it with a better set that is a nearby timepoint.  
+
+#### Library Size
+Raul says this is a library size outlier. Check that by plotting log(library_size).
+```{r}
+lib <- dge_all$samples %>% as.data.frame()
+lib_text <- rownames_to_column(lib) %>% dplyr::filter(rowname == "kallisto_14_EU144_T18_Mtb_MOI_5_run1")
+
+ggplot(data=lib, aes(x=log10(lib.size))) +
+    geom_histogram(binwidth = 0.05, color = "grey", fill = "ivory") +
+    geom_jitter(color = "black", alpha = 0.5, aes(y = 0), height = 5) +
+    geom_text(data = lib_text, aes(x=log10(lib.size), label = rowname, y = 1), size = 3, angle = 90, hjust = -0.1) +
+    theme_bw() +
+    ylab("count") +
+    theme(legend.position = "none")
+```
+
+Raul recommends that I remove the sample from the analysis. kallisto_14_EU144_T18_Mtb_MOI_5_run1 will be removed and replaced with the T16 timepoint. I will apply this to the filtered-samples_cts later on.  
+
+2) Check that there are no NAs for any gene or samples.
+```{r}
+which(is.na(cts_3_all))
+```
+This worked, there are no NA values. 
+
+## Explore filtered data
+
+By exploring all data, we determined there were no NA values and that the sample "kallisto_14_EU144_T18_Mtb_MOI_5_run1" was bad. 
+
+Next we want to explore the "filtered" data that is donor-timepoint matched across infection conditions. Previously, I had to fill in data for NI samples by adjusting the timepoints to match or by duplicating nearby timepoints for missing timepoints. This was done in the previous notebooks. For this reason the rownames for some samples will be different from the rownames in the all samples. 
+
+First, I want to fix the bad sample by swapping with the T16 timepoint, however the T16 time point is not in the filtered samples, so I will have to use it from the all samples counts file. 
+
+### Swap library count outlier
+```{r}
+#read in cts
+cts <- read_tsv("data/kallisto.gene-level.lengthScaledTPM.duplicates-included.tsv", show_col_types = F) 
+
+#I checked and this worked
+cts$kallisto_14_EU144_T18_Mtb_MOI_5_run1 <- cts_all$kallisto_14_EU144_T16_Mtb_MOI_5_run1
+```
+
+### Read in sample info and set design
+
+In this case, I want to setup the design matrix to model the interaction between Infection and Timepoint, but model with timepoint as a categorical variable. The covariates here are GC, Dups, Aligned, and flow_cell. We can't do run or sex because they are nested within the flow_cell variable and it is impossible to model separately. 
+
+This is design is different that with all samples because we didn't have donor-timepoing matched infection conditions for all. 
+```{r}
+#read in sample info/metadata and sort alphabetically by filename
+sample_info <- read_tsv("results/metadata_filtered-samples_with-covariates.tsv", col_names = T, show_col_types = F) %>% column_to_rownames("filename")
+
+#convert flow_cell to factor:
+sample_info$flow_cell <- factor(sample_info$flow_cell)
+
+#relevel infection:
+sample_info$Infection <- factor(sample_info$Infection, levels = c("NI", "Mtb"))
+
+#convert sex to factor:
+sample_info$Sex <- factor(sample_info$Sex)
+
+#reorder timepoint levels:
+sample_info$Timepoint <- factor(sample_info$Timepoint, levels = c("T1","T3","T5","T8","T12","T18","T24","T30","T36"))
+
+#set design matrix for filtered data and all
+design <- model.matrix( ~ 0 + Timepoint:Infection + Timepoint + Donor_ID + perc_GC + perc_Dups + perc_Aligned + flow_cell, data = sample_info)
+```
+
+
+#### Filter counts
+The general filtering strategy is the same as in the all samples, but we will compare three strategies of removing low count data.  
+
+Filter counts at three levels: 1) protein coding genes only; 2) samples from filtered metadata table (not all samples will be analyzed); 3) remove low count data. 
+
+1) protein coding filter
+```{r}
+#read in GTF
+gtf_file <- "data/Homo_sapiens.GRCh38.87.gtf"
+gtf <- readGFFAsGRanges(gtf_file)
+
+#extract protein coding genes. I checked and this entire pipe works. 
+pc_gene_ids <- plyranges::filter(gtf, type == 'gene', gene_biotype == 'protein_coding') %>% as.data.frame() %>% dplyr::select(gene_id, gene_name)
+
+#join with counts to select protein coding genes.
+cts_1 <- left_join(pc_gene_ids, cts, by = 'gene_id')
+
+#merge ensembl_id and gene name and set as to rownames. 
+cts_1 <- unite(cts_1, "ID", gene_id:gene_name, sep = "_") %>% column_to_rownames(var = "ID")
+```
+
+2) samples from metadata table
+```{r}
+#filter samples from cts
+cts_2 <- dplyr::select(cts_1, intersect(colnames(cts_1), row.names(sample_info))) 
+
+#match cts_2 colname order with sample info order. 
+cts_2 <- select(cts_1, matches(rownames(sample_info)))
+
+#for some reason, this doesn't work perfectly, so fix with this code: 
+cts_2 <- relocate(cts_2, kallisto_14_EU144_T4_NI_run1_duplicated_duplicated, .after = kallisto_5_AF95_T12_NI_run1_duplicated)
+
+#if match, then this will print true
+all(rownames(design) == colnames(cts_2))
+```
+
+3.1) remove low count data with filterByExpr
+```{r}
+#filter using filterByExpr
+dge <- DGEList(cts_2)
+keep <- filterByExpr(dge, design)
+cts_3 <- cts_2[keep,]
+
+#report how much was lost
+print('total features remaining')
+nrow(cts_3)
+print('total features removed') 
+nrow(cts_2) - nrow(cts_3)
+```
+After filtering there are 16,423 genes remaining. Luis thinks this is too many and typically the target is ~10,000. I will try to filter a different way using tpm > 1.
+
+3.2) remove low count data by tpm > 1
+```{r}
+cutoff <- 1
+drop <- which(apply(cpm(cts_2), 1, max) < cutoff)
+cts_4 <- cts_2[-drop,]
+
+#report how much was lost
+print('total features remaining')
+nrow(cts_4)
+print('total features removed') 
+nrow(cts_2) - nrow(cts_4)
+```
+After filtering there are 16,012 genes remaining. So roughly the same amount. Again, Luis thinks this is too many and typically the target is ~10,000. I will try to filter a different way that She learned in Luis' class. 
+
+3.3) remove low count data by voom-transformed row medians > 1.5
+```{r}
+#voom transform first
+dge <- DGEList(cts_2)
+dge <- calcNormFactors(dge)
+v <- voom(dge, design, plot = F)
+
+#filter genes based on voom-transformed row medians > 1.5. This is equivalent to 10^1.5 = 31.6 raw counts. This is much more stringent.  
+keep <- data.frame(genes = rownames(cts_2), medians = apply(v$E, 1, median), order = 1:nrow(cts_2))
+cts_5 <- cts_2[which(keep$medians > 1.5), ]
+
+#report how much was lost
+print('total features remaining')
+nrow(cts_5)
+print('total features removed') 
+nrow(cts_2) - nrow(cts_5)
+```
+After filtering there are 11,013 genes remaining. So this is more in line with Luis' expectation. We will compare this one (cts_5) and the filterByExpr one (cts_3). 
+
+#### Compare the two count filtering strategies. 
+
+First lets voom transform them and look at the output plots. 
+```{r}
+#if match, then this will print true
+all(rownames(design) == colnames(cts_3))
+all(rownames(design) == colnames(cts_5))
+
+#cts_3 - make dgelist again and voom transform
+dge_3 <- DGEList(cts_3)
+dge_3 <- calcNormFactors(dge_3)
+v_3 <- voom(dge_3, design, plot = T)
+
+#cts_5 - make dgelist again and voom transform
+dge_5 <- DGEList(cts_5)
+dge_5 <- calcNormFactors(dge_5)
+v_5 <- voom(dge_5, design, plot = T)
+```
+
+To me the cts_5 seems to have a better relationship between the variance and count size, such that the lowest count data does not have a very low to very high pattern of variance like in cts_3. These lower counts are likely to be counfounding. I will proceede with cts_5 for now. I may revisit this with additional analyses later on. 
+
+### Explore data 
+There are a few things we want to do before moving forward. 
+
+1) First we want to double check that the library outlier was removed. 
+2) We also want to check that there are no NAs for any gene or samples. 
+3) We want to understand if the dataset is balanced among the variables, so that we are not over correcting for each covariate.
+4) And we want to look at possible confounder variables by looking at PCAs. 
+
+#### Library outlier check
+```{r}
+lib <- dge_5$samples %>% as.data.frame()
+
+ggplot(data=lib, aes(x=log10(lib.size))) +
+    geom_histogram(binwidth = 0.05, color = "grey", fill = "ivory") +
+    geom_jitter(color = "black", alpha = 0.5, aes(y = 0), height = 5) +
+    theme_bw() +
+    ylab("count") +
+    theme(legend.position = "none")
+```
+
+Great! The library size outlier is gone. 
+
+Lets just check the voom transformed count ditribution, to be sure that is still good.
+```{r}
+df_v <- as.data.frame(v_5$E) %>% rownames_to_column("gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+
+ggplot(data=df_v, aes(x=counts, group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+Looks great!
+
+
+#### Check that there are no NAs for any gene or samples.
+```{r}
+which(is.na(cts_5))
+```
+There are no NA values. 
+
+#### Check balance
+Determine if variables are balanced using tables. 
+```{r}
+table(sample_info$self_reported_ethnicity, sample_info$flow_cell)
+table(sample_info$self_reported_ethnicity, sample_info$Run)
+table(sample_info$self_reported_ethnicity, sample_info$db)
+table(sample_info$self_reported_ethnicity, sample_info$Sex)
+table(sample_info$self_reported_ethnicity, sample_info$Age)
+
+table(sample_info$db, sample_info$flow_cell)
+
+table(sample_info$Sex, sample_info$flow_cell)
+table(sample_info$Sex, sample_info$Run)
+```
+Male/female and MLS/upenn could be confounding variables but it is impossible to regress them out while also regressing out flow_cell. Let's compare them all by looking at PCAs. 
+
+#### PCAs
+Calculate PCAs
+```{r}
+mat <- as.matrix(v_5$E) %>% t()
+pcamat <- prcomp(mat)
+```
+
+Plot variance explained by top 20 PCAs
+```{r}
+#variance explained by PCs
+pc_eigenvalues <- pcamat$sdev^2
+
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), 
+                         variance = pc_eigenvalues) %>%
+  mutate(pct = variance/sum(variance)*100) %>%
+  mutate(pct_cum = cumsum(pct))
+
+pc_eigenvalues %>% 
+  ggplot(aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + coord_cartesian(xlim = c(0,50))
+```
+
+PC1 and PC2 explains a lot, but it looks like PCs1-5 contribute as well.  
+
+Plot PC1 and PC2 and use color/point type for variables
+```{r, fig.dim=c(9,5)}
+#Prepare tibble for plotting
+pc_scores <- as_tibble(pcamat$x, rownames = "filename")
+
+#add metadata
+metadata <- rownames_to_column(sample_info, var = "filename")
+pc_scores <- left_join(pc_scores, metadata, by = "filename")
+
+#relevel infection:
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_run <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Run, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_sex <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Sex, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_db <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = db, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_GC <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = perc_GC, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_align <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = perc_Aligned, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_dups <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = perc_Dups, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = African_admixture, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_age <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Age, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores <- mutate(pc_scores, is_AF69 = (Donor_ID == "AF69"))
+
+p_AF69 <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = is_AF69, shape = Run, size = Infection)) +
+  geom_point(alpha = 0.9) +
+  scale_color_manual(values = c("grey", "red")) +
+  scale_shape_manual(values = c(19,4,18,2)) +
+  scale_size_manual(values = c(2,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_time
+p_donor
+p_run
+p_flow
+p_sex
+p_db
+p_GC
+p_align
+p_dups
+p_ancestry
+p_age
+p_AF69
+```
+
+So on PC1, it looks like the infection affect is the most prominent, but within NI there is batch to batch variation across both the run and flow cell variables. Regressing this out will help. The db has an effect as well, but this is likely due to the batch variation. Surprisingly, sex does not cluster, so I think it is okay that we will not be able to control for it. Age may have an effect, so we should try to find the age information to include in the model, but I have no idea where it is.  
+
+PC2 seems to maybe account for the timepoint, but it it isn't super clear. It may be a combination of technical factors, timepoint, and admixture.
+
+When looking at AF69, you can see there are clearly batch effects. They need to be removed.
+
+Lets perform a sound statistical method of identifying batch variables and covaraites to include in the model. 
+
+## Identify Relevant Technical Confounders
+
+Following the procedure used in Nedelec et al. Cell 2016, identify technical confounders in the filtered dataset. 
+
+1. Let model_ref denote the reference model with no covariates where only an intercept is estimated for the gene expression data. In addition, model_x is the model with reference model with only one additional covariate "x" and do this for all possible covariates. Estimate the variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models. 
+
+2. For each technical confounder, conduct the following procedure for 200 iterations per gene:
+  a) Permute the entries of the original confounder "x"
+  b) Set up a model_random which is the reference model with the permuted covariate "x"
+  c) Calculate the random variance in expression data explained (v_random) by (SS_ref-SS_random)/SS_ref
+
+3. For each confounder, compare the distribution of v_x of all genes to the distributions of randomized values (v_random) with a Mann-Whitney U test. The shift between the two ditributions at a significance level of p = 0.05 is denoted by delta_x. 
+
+4. Compare the delta_x values for all confounders and chose the technical confounder with the maximum shift, if delta > 0.01, so add to the reference model. 
+
+5. Repeat Steps 1-3 using the updated reference model. After re-evaluating the delta_x values:
+  a) Among the set of confounders present in model_ref, remove the one with the lowest delta value from model_ref, if the shift was below 0.01. 
+  b) Among the set of confounders absent from model_ref, add the one which satisfied the selection procedure described in step 4 to the reference model. 
+
+6. Repeat step 5 until a refernce model is obtained where only the covariats in the model satified the condition in step 4 (i.e., their contribution in explaining the variability in the data is least 1% more than that of an arbitrary random variable). 
+
+### Step 1
+Technical Confounders to Measure:
+1. Run
+2. flow_cell
+3. database (db)
+4. Sex
+5. Location
+6. perc_dups
+7. perc_GC
+8. perc_aligned
+
+Note: Only one of Run/flow_cell/location will be allowed to be in the model because they are nested within each other. Nonetheless, identify their deltas to see which has the greatest effect. Ideally, we would use flow_Cell, but I am guessing run is the largest of the five. 
+
+Set-up Models
+```{r}
+model_ref <- model.matrix(~1, data = sample_info)
+model_run <- model.matrix(~Run, data = sample_info)
+model_fc <- model.matrix(~flow_cell, data = sample_info)
+model_db <- model.matrix(~db, data = sample_info)
+model_sex <- model.matrix(~Sex, data = sample_info)
+model_loc <- model.matrix(~Location, data = sample_info)
+model_dups <- model.matrix(~perc_Dups, data = sample_info)
+model_gc <- model.matrix(~perc_GC, data = sample_info)
+model_aligned <- model.matrix(~perc_Aligned, data = sample_info)
+```
+
+Fit data to each model
+```{r}
+#fit model - eBayes is not needed for extracting residuals and the values of vfit and efit are identical when extracting residuals
+vfit_ref <- lmFit(v_5, model_ref)
+vfit_run <- lmFit(v_5, model_run)
+vfit_fc <-lmFit(v_5, model_fc)
+vfit_db <-lmFit(v_5, model_db)
+vfit_sex <-lmFit(v_5, model_sex)
+vfit_loc <-lmFit(v_5, model_loc)
+vfit_dups <-lmFit(v_5, model_dups)
+vfit_gc <-lmFit(v_5, model_gc)
+vfit_aligned <-lmFit(v_5, model_aligned)
+```
+
+Calculate residual sum of squares for each gene
+```{r}
+rss_ref <- rowSums(residuals(vfit_ref, v_5$E)^2)
+rss_run <- rowSums(residuals(vfit_run, v_5$E)^2)
+rss_fc <- rowSums(residuals(vfit_fc, v_5$E)^2)
+rss_db <- rowSums(residuals(vfit_db, v_5$E)^2)
+rss_sex <- rowSums(residuals(vfit_sex, v_5$E)^2)
+rss_loc <- rowSums(residuals(vfit_loc, v_5$E)^2)
+rss_dups <- rowSums(residuals(vfit_dups, v_5$E)^2)
+rss_gc <- rowSums(residuals(vfit_gc, v_5$E)^2)
+rss_aligned <- rowSums(residuals(vfit_aligned, v_5$E)^2)
+```
+
+Estimate the variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+```{r}
+all(rownames(rss_ref) == rownames(rss_run))
+all(rownames(rss_ref) == rownames(rss_fc))
+all(rownames(rss_ref) == rownames(rss_db))
+all(rownames(rss_ref) == rownames(rss_sex))
+all(rownames(rss_ref) == rownames(rss_loc))
+all(rownames(rss_ref) == rownames(rss_dups))
+all(rownames(rss_ref) == rownames(rss_gc))
+all(rownames(rss_ref) == rownames(rss_aligned))
+
+v_run <- (rss_ref - rss_run)/rss_ref
+v_fc <- (rss_ref - rss_fc)/rss_ref
+v_db <- (rss_ref - rss_db)/rss_ref
+v_sex <- (rss_ref - rss_sex)/rss_ref
+v_loc <- (rss_ref - rss_loc)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+v_gc <- (rss_ref - rss_gc)/rss_ref
+v_aligned <- (rss_ref - rss_aligned)/rss_ref
+```
+
+
+### Step 2
+
+For 200 interations, permute using permutations() function from rsample package, model perumted data, calculate RSS variance for that model for each gene, then append to a vector. 
+
+I wrote this as a function to operate, it returns a vector of the RSS variance for each gene 
+```{r}
+library(rsample)
+library(rlist)
+
+#function to run on each confounder
+permute_si_vars <- function(confounder, sample_info = sample_info, n) {
+  #permute the variable of interest
+  x <- permutations(sample_info, permute = all_of(confounder), times = n)
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+  for (i in seq(1, n)) {
+    #extract permuted ith iteration
+    si_rand <- x$splits[[i]] %>% analysis() %>% as.data.frame()
+    
+    #add to list
+    list_x <- list.append(list_x, si_rand)
+  }
+
+  #return list
+  return(list_x)
+}
+
+estimate_random_variance <- function(perms, formula, voom_cts, n, rss_ref) {
+  # set up dummy vector
+  vec <- c()
+  #extract each iteration and set_up random models:
+    for (i in seq(1, n)) {
+      #set up model for ith iteration
+      m_rand <- model.matrix(as.formula(formula), data = as.data.frame(perms[i]))
+    
+      #fit model for each iteration
+      vfit_rand <- lmFit(voom_cts, m_rand)
+    
+      #Calculate the resisual sum of squares for each iteration for each gene
+      rss_rand <- rowSums(residuals(vfit_rand, voom_cts$E)^2)
+      
+      if (all(rownames(rss_ref) == rownames(rss_rand))) {
+      #Estimate the variance in expression data explained
+      v <- (rss_ref - rss_rand)/rss_ref
+      } else {
+        stop("random rownames do not match reference rownames")
+      }
+      vec <- append(vec, v)
+    }
+  return(vec)
+}
+```
+
+Permute variables
+```{r}
+run_perms <- permute_si_vars("Run", sample_info, n = 50)
+fc_perms <- permute_si_vars("flow_cell", sample_info, n = 50)
+db_perms <- permute_si_vars("db", sample_info, n = 50)
+sex_perms <- permute_si_vars("Sex", sample_info, n = 50)
+loc_perms <- permute_si_vars("Location", sample_info, n = 50)
+dups_perms <- permute_si_vars("perc_Dups", sample_info, n = 50)
+gc_perms <- permute_si_vars("perc_GC", sample_info, n = 50)
+aligned_perms <- permute_si_vars("perc_Aligned", sample_info, n = 50)
+```
+
+
+estimate random variance of variable with model_x models
+```{r}
+v_run_rand <- estimate_random_variance(run_perms, formula = "~ Run", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_fc_rand <- estimate_random_variance(fc_perms, "~ flow_cell", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_db_rand <- estimate_random_variance(db_perms, "~ db", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_sex_rand <- estimate_random_variance(sex_perms, "~ Sex", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_loc_rand <- estimate_random_variance(loc_perms, "~ Location", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_dups_rand <- estimate_random_variance(dups_perms, "~ perc_Dups", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_gc_rand <- estimate_random_variance(gc_perms, "~ perc_GC", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_aligned_rand <- estimate_random_variance(aligned_perms, "~ perc_Aligned", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+```
+
+### Step 3
+
+```{r}
+get_delta <- function(x, y) {
+  
+  #calculate pval for mann-whitney
+  MU_test <- wilcox.test(x = x, y = y)
+  
+  #if pval < 0.05, calculate delta by subtracting means and applying absolute value. 
+  if (MU_test$p.val < 0.05) {
+    delta <- abs(mean(x) - mean(y))
+    #return delta
+    return(delta)
+  } else {
+    print("not significant")
+  }
+}
+```
+
+Execute functions and output deltas
+```{r}
+get_delta(x = v_run, y = v_run_rand)
+get_delta(x = v_fc, y = v_fc_rand)
+get_delta(x = v_db, y = v_db_rand)
+get_delta(x = v_sex, y = v_sex_rand)
+get_delta(x = v_loc, y = v_loc_rand)
+get_delta(x = v_dups, y = v_dups_rand)
+get_delta(x = v_gc, y = v_gc_rand)
+get_delta(x = v_aligned, y = v_aligned_rand)
+```
+
+### Step 4
+Compare the delta_x values for all confounders and chose the technical confounder with the maximum shift, if delta > 0.01, so add to the reference model. 
+
+This is obvious based on values above, but plot to show the distributions. 
+```{r}
+#convert real values to dfs and label.
+df_run <- v_run %>% as.data.frame()
+colnames(df_run) <- "Batch"
+
+df_fc <- v_fc %>% as.data.frame()
+colnames(df_fc) <- "Flow Cell"
+
+df_db <- v_db %>% as.data.frame()
+colnames(df_db) <- "Sample Source"
+
+df_sex <- v_sex %>% as.data.frame()
+colnames(df_sex) <- "Sex"
+
+df_loc <- v_loc %>% as.data.frame()
+colnames(df_loc) <- "Location Prepared"
+
+df_dups <- v_dups %>% as.data.frame()
+colnames(df_dups) <- "% Duplicated"
+
+df_gc <- v_gc %>% as.data.frame()
+colnames(df_gc) <- "% GC"
+
+df_aligned <- v_aligned %>% as.data.frame()
+colnames(df_aligned) <- "% Aligned"
+
+#bind cols
+df_real <- bind_cols(df_run, df_fc, df_db, df_sex, df_loc, df_dups, df_gc, df_aligned) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_run_rand <- v_run_rand %>% as.data.frame()
+colnames(df_run_rand) <- "Batch"
+
+df_fc_rand <- v_fc_rand %>% as.data.frame()
+colnames(df_fc_rand) <- "Flow Cell"
+
+df_db_rand <- v_db_rand %>% as.data.frame()
+colnames(df_db_rand) <- "Sample Source"
+
+df_sex_rand <- v_sex_rand %>% as.data.frame()
+colnames(df_sex_rand) <- "Sex"
+
+df_loc_rand <- v_loc_rand %>% as.data.frame()
+colnames(df_loc_rand) <- "Location Prepared"
+
+df_dups_rand <- v_dups_rand %>% as.data.frame()
+colnames(df_dups_rand) <- "% Duplicated"
+
+df_gc_rand <- v_gc_rand %>% as.data.frame()
+colnames(df_gc_rand) <- "% GC"
+
+df_aligned_rand <- v_aligned_rand %>% as.data.frame()
+colnames(df_aligned_rand) <- "% Aligned"
+
+#bind cols
+df_random <- bind_cols(df_run_rand, df_fc_rand, df_db_rand, df_sex_rand, df_loc_rand, df_dups_rand, df_gc_rand, df_aligned_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("Flow Cell", "Batch", "% Aligned", "Sample Source", "% GC", "% Duplicated", "Sex", "Location Prepared")))
+```
+
+```{r}
+p <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "slateblue")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p
+```
+
+
+Flow_cell has the largest delta. Add to reference model. 
+
+### Step 5
+Repeat Steps 1-3 using the updated reference model. After re-evaluating the delta_x values:
+  a) Among the set of confounders present in model_ref, remove the one with the lowest delta value from model_ref, if the shift was below 0.01. 
+  b) Among the set of confounders absent from model_ref, add the one which satisfied the selection procedure described in step 4 to the reference model. 
+
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ flow_cell, data = sample_info)
+
+#set up new models
+model_run <- model.matrix(~ flow_cell + Run, data = sample_info)
+model_db <- model.matrix(~ flow_cell + db, data = sample_info)
+model_sex <- model.matrix(~ flow_cell + Sex, data = sample_info)
+model_loc <- model.matrix(~ flow_cell + Location, data = sample_info)
+model_dups <- model.matrix(~ flow_cell + perc_Dups, data = sample_info)
+model_gc <- model.matrix(~ flow_cell + perc_GC, data = sample_info)
+model_aligned <- model.matrix(~ flow_cell + perc_Aligned, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v_5, model_ref)
+vfit_run <- lmFit(v_5, model_run)
+vfit_db <-lmFit(v_5, model_db)
+vfit_sex <-lmFit(v_5, model_sex)
+vfit_loc <-lmFit(v_5, model_loc)
+vfit_dups <-lmFit(v_5, model_dups)
+vfit_gc <-lmFit(v_5, model_gc)
+vfit_aligned <-lmFit(v_5, model_aligned)
+```
+
+As expected, loc and run are not possible now that flow cell exists. Drop them. 
+```{r}
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v_5$E)^2)
+rss_db <- rowSums(residuals(vfit_db, v_5$E)^2)
+rss_sex <- rowSums(residuals(vfit_sex, v_5$E)^2)
+rss_dups <- rowSums(residuals(vfit_dups, v_5$E)^2)
+rss_gc <- rowSums(residuals(vfit_gc, v_5$E)^2)
+rss_aligned <- rowSums(residuals(vfit_aligned, v_5$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_db <- (rss_ref - rss_db)/rss_ref
+v_sex <- (rss_ref - rss_sex)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+v_gc <- (rss_ref - rss_gc)/rss_ref
+v_aligned <- (rss_ref - rss_aligned)/rss_ref
+
+#generate random variance
+v_db_rand <- estimate_random_variance(db_perms, "~ flow_cell + db", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_sex_rand <- estimate_random_variance(sex_perms, "~ flow_cell + Sex", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_dups_rand <- estimate_random_variance(dups_perms, "~ flow_cell + perc_Dups", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_gc_rand <- estimate_random_variance(gc_perms, "~ flow_cell + perc_GC", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_aligned_rand <- estimate_random_variance(aligned_perms, "~ flow_cell + perc_Aligned", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_db, y = v_db_rand)
+get_delta(x = v_sex, y = v_sex_rand)
+get_delta(x = v_dups, y = v_dups_rand)
+get_delta(x = v_gc, y = v_gc_rand)
+get_delta(x = v_aligned, y = v_aligned_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_db <- v_db %>% as.data.frame()
+colnames(df_db) <- "Sample Source"
+
+df_sex <- v_sex %>% as.data.frame()
+colnames(df_sex) <- "Sex"
+
+df_dups <- v_dups %>% as.data.frame()
+colnames(df_dups) <- "% Duplicated"
+
+df_gc <- v_gc %>% as.data.frame()
+colnames(df_gc) <- "% GC"
+
+df_aligned <- v_aligned %>% as.data.frame()
+colnames(df_aligned) <- "% Aligned"
+
+#bind cols
+df_real <- bind_cols(df_db, df_sex, df_dups, df_gc, df_aligned) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_db_rand <- v_db_rand %>% as.data.frame()
+colnames(df_db_rand) <- "Sample Source"
+
+df_sex_rand <- v_sex_rand %>% as.data.frame()
+colnames(df_sex_rand) <- "Sex"
+
+df_dups_rand <- v_dups_rand %>% as.data.frame()
+colnames(df_dups_rand) <- "% Duplicated"
+
+df_gc_rand <- v_gc_rand %>% as.data.frame()
+colnames(df_gc_rand) <- "% GC"
+
+df_aligned_rand <- v_aligned_rand %>% as.data.frame()
+colnames(df_aligned_rand) <- "% Aligned"
+
+#bind cols
+df_random <- bind_cols(df_db_rand, df_sex_rand, df_dups_rand, df_gc_rand, df_aligned_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("% GC", "% Aligned", "% Duplicated", "Sex", "Sample Source")))
+
+#plot
+p_1 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "skyblue")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_1
+```
+
+perc_gc is highest, add to the reference model and move to step 6. 
+
+### Step 6
+Repeat step 5 until a refernce model is obtained where only the covariats in the model satified the condition in step 4. 
+
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ flow_cell + perc_GC, data = sample_info)
+
+#set up new models
+model_db <- model.matrix(~ flow_cell + perc_GC + db, data = sample_info)
+model_sex <- model.matrix(~ flow_cell + perc_GC + Sex, data = sample_info)
+model_dups <- model.matrix(~ flow_cell + perc_GC + perc_Dups, data = sample_info)
+model_aligned <- model.matrix(~ flow_cell + perc_GC + perc_Aligned, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v_5, model_ref)
+vfit_db <-lmFit(v_5, model_db)
+vfit_sex <-lmFit(v_5, model_sex)
+vfit_dups <-lmFit(v_5, model_dups)
+vfit_aligned <-lmFit(v_5, model_aligned)
+
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v_5$E)^2)
+rss_db <- rowSums(residuals(vfit_db, v_5$E)^2)
+rss_sex <- rowSums(residuals(vfit_sex, v_5$E)^2)
+rss_dups <- rowSums(residuals(vfit_dups, v_5$E)^2)
+rss_aligned <- rowSums(residuals(vfit_aligned, v_5$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_db <- (rss_ref - rss_db)/rss_ref
+v_sex <- (rss_ref - rss_sex)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+v_aligned <- (rss_ref - rss_aligned)/rss_ref
+
+#generate random variance
+v_db_rand <- estimate_random_variance(db_perms, "~ flow_cell + perc_GC + db", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_sex_rand <- estimate_random_variance(sex_perms, "~ flow_cell + perc_GC + Sex", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_dups_rand <- estimate_random_variance(dups_perms, "~ flow_cell + perc_GC + perc_Dups", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_aligned_rand <- estimate_random_variance(aligned_perms, "~ flow_cell + perc_GC + perc_Aligned", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_db, y = v_db_rand)
+get_delta(x = v_sex, y = v_sex_rand)
+get_delta(x = v_dups, y = v_dups_rand)
+get_delta(x = v_aligned, y = v_aligned_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_db <- v_db %>% as.data.frame()
+colnames(df_db) <- "Sample Source"
+
+df_sex <- v_sex %>% as.data.frame()
+colnames(df_sex) <- "Sex"
+
+df_dups <- v_dups %>% as.data.frame()
+colnames(df_dups) <- "% Duplicated"
+
+df_aligned <- v_aligned %>% as.data.frame()
+colnames(df_aligned) <- "% Aligned"
+
+#bind cols
+df_real <- bind_cols(df_db, df_sex, df_dups, df_aligned) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_db_rand <- v_db_rand %>% as.data.frame()
+colnames(df_db_rand) <- "Sample Source"
+
+df_sex_rand <- v_sex_rand %>% as.data.frame()
+colnames(df_sex_rand) <- "Sex"
+
+df_dups_rand <- v_dups_rand %>% as.data.frame()
+colnames(df_dups_rand) <- "% Duplicated"
+
+df_aligned_rand <- v_aligned_rand %>% as.data.frame()
+colnames(df_aligned_rand) <- "% Aligned"
+
+#bind cols
+df_random <- bind_cols(df_db_rand, df_sex_rand, df_dups_rand, df_aligned_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("% Aligned", "% Duplicated", "Sex", "Sample Source")))
+
+#plot
+p_2 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "springgreen2")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_2
+```
+
+
+Next is perc_Aligned. 
+
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ flow_cell + perc_GC + perc_Aligned, data = sample_info)
+
+#set up new models
+model_db <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + db, data = sample_info)
+model_sex <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + Sex, data = sample_info)
+model_dups <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + perc_Dups, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v_5, model_ref)
+vfit_db <-lmFit(v_5, model_db)
+vfit_sex <-lmFit(v_5, model_sex)
+vfit_dups <-lmFit(v_5, model_dups)
+
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v_5$E)^2)
+rss_db <- rowSums(residuals(vfit_db, v_5$E)^2)
+rss_sex <- rowSums(residuals(vfit_sex, v_5$E)^2)
+rss_dups <- rowSums(residuals(vfit_dups, v_5$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_db <- (rss_ref - rss_db)/rss_ref
+v_sex <- (rss_ref - rss_sex)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+
+#generate random variance
+v_db_rand <- estimate_random_variance(db_perms, "~ flow_cell + perc_GC + perc_Aligned + db", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_sex_rand <- estimate_random_variance(sex_perms, "~ flow_cell + perc_GC + perc_Aligned + Sex", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_dups_rand <- estimate_random_variance(dups_perms, "~ flow_cell + perc_GC + perc_Aligned + perc_Dups", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_db, y = v_db_rand)
+get_delta(x = v_sex, y = v_sex_rand)
+get_delta(x = v_dups, y = v_dups_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_db <- v_db %>% as.data.frame()
+colnames(df_db) <- "Sample Source"
+
+df_sex <- v_sex %>% as.data.frame()
+colnames(df_sex) <- "Sex"
+
+df_dups <- v_dups %>% as.data.frame()
+colnames(df_dups) <- "% Duplicated"
+
+#bind cols
+df_real <- bind_cols(df_db, df_sex, df_dups) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_db_rand <- v_db_rand %>% as.data.frame()
+colnames(df_db_rand) <- "Sample Source"
+
+df_sex_rand <- v_sex_rand %>% as.data.frame()
+colnames(df_sex_rand) <- "Sex"
+
+df_dups_rand <- v_dups_rand %>% as.data.frame()
+colnames(df_dups_rand) <- "% Duplicated"
+
+#bind cols
+df_random <- bind_cols(df_db_rand, df_sex_rand, df_dups_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("% Duplicated", "Sex", "Sample Source")))
+
+#plot
+p_3 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "lightseagreen")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_3
+```
+
+Add perc_dups
+
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + perc_Dups, data = sample_info)
+
+#set up new models
+model_db <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + perc_Dups + db, data = sample_info)
+model_sex <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v_5, model_ref)
+vfit_db <-lmFit(v_5, model_db)
+vfit_sex <-lmFit(v_5, model_sex)
+
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v_5$E)^2)
+rss_db <- rowSums(residuals(vfit_db, v_5$E)^2)
+rss_sex <- rowSums(residuals(vfit_sex, v_5$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_db <- (rss_ref - rss_db)/rss_ref
+v_sex <- (rss_ref - rss_sex)/rss_ref
+
+#generate random variance
+v_db_rand <- estimate_random_variance(db_perms, "~ flow_cell + perc_GC + perc_Aligned + perc_Dups + db", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+v_sex_rand <- estimate_random_variance(sex_perms, "~ flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_db, y = v_db_rand)
+get_delta(x = v_sex, y = v_sex_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_db <- v_db %>% as.data.frame()
+colnames(df_db) <- "Sample Source"
+
+df_sex <- v_sex %>% as.data.frame()
+colnames(df_sex) <- "Sex"
+
+#bind cols
+df_real <- bind_cols(df_db, df_sex) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_db_rand <- v_db_rand %>% as.data.frame()
+colnames(df_db_rand) <- "Sample Source"
+
+df_sex_rand <- v_sex_rand %>% as.data.frame()
+colnames(df_sex_rand) <- "Sex"
+
+#bind cols
+df_random <- bind_cols(df_db_rand, df_sex_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("Sex", "Sample Source")))
+
+#plot
+p_4 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "paleturquoise")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_4
+```
+
+add sex
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex, data = sample_info)
+
+#set up new models
+model_db <- model.matrix(~ flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex + db, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v_5, model_ref)
+vfit_db <-lmFit(v_5, model_db)
+
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v_5$E)^2)
+rss_db <- rowSums(residuals(vfit_db, v_5$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_db <- (rss_ref - rss_db)/rss_ref
+
+#generate random variance
+v_db_rand <- estimate_random_variance(db_perms, "~ flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex + db", voom_cts = v_5, n = 50, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_db, y = v_db_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_db <- v_db %>% as.data.frame()
+colnames(df_db) <- "Sample Source"
+
+#bind cols
+df_real <- bind_cols(df_db) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_db_rand <- v_db_rand %>% as.data.frame()
+colnames(df_db_rand) <- "Sample Source"
+
+#bind cols
+df_random <- bind_cols(df_db_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("Sample Source")))
+
+#plot
+p_5 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "sienna")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_5
+```
+
+Do not include db. 
+
+So the final technical covariate part of the model is: 
+  expr ~ flow_cell + perc_GC + perc_Aligned + perc_Dups + Sex
+  
+When wanting to account for donor variation (such as in Infection effects overtime) sex cannot be a covariate since it is nested within donor_id. 
+
+## Remove technical confounders and explore again
+
+To do this, use the removeBatchEffect function from limma. Provide the flow_cell as the batch and perc_GC, perc_Aligned, perc_Dups as covariates. 
+
+```{r}
+design_batch_removed <- model.matrix( ~ 0 + Timepoint:Infection + Timepoint + Donor_ID, data = sample_info)
+all(colnames(v_5$E) == rownames(sample_info))
+v_batchRemoved <- removeBatchEffect(v_5, batch = sample_info$flow_cell, covariates = sample_info[,9:11], design = design_batch_removed)
+```
+
+#### PCAs
+Calculate PCAs
+```{r}
+mat <- as.matrix(v_batchRemoved) %>% t()
+pcamat <- prcomp(mat)
+```
+
+Plot variance explained by top 20 PCAs
+```{r}
+#variance explained by PCs
+pc_eigenvalues <- pcamat$sdev^2
+
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), 
+                         variance = pc_eigenvalues) %>%
+  mutate(pct = variance/sum(variance)*100) %>%
+  mutate(pct_cum = cumsum(pct))
+
+pc_eigenvalues %>% 
+  ggplot(aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + coord_cartesian(xlim = c(0,50))
+```
+
+PC1 and PC2 explains a lot, but it looks like PCs1-5 contribute as well.  
+
+Plot PC1 and PC2 and use color/point type for variables
+```{r, fig.dim=c(9,5)}
+#Prepare tibble for plotting
+pc_scores <- as_tibble(pcamat$x, rownames = "filename")
+
+#add metadata
+metadata <- rownames_to_column(sample_info, var = "filename")
+pc_scores <- left_join(pc_scores, metadata, by = "filename")
+
+#relevel infection:
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_run <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Run, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_sex <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Sex, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_db <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = db, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_GC <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = perc_GC, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_align <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = perc_Aligned, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_dups <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = perc_Dups, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = African_admixture, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_age <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Age, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+pc_scores <- mutate(pc_scores, is_AF69 = (Donor_ID == "AF69"))
+
+p_AF69 <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = is_AF69, shape = Run, size = Infection)) +
+  geom_point(alpha = 0.9) +
+  scale_color_manual(values = c("grey", "red")) +
+  scale_shape_manual(values = c(19,4,18,2)) +
+  scale_size_manual(values = c(2,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_time
+p_donor
+p_run
+p_flow
+p_sex
+p_db
+p_GC
+p_align
+p_dups
+p_ancestry
+p_age
+p_AF69
+```
+So this make it look like batch effects still exist, but if we look at AF69, it looks like batch effects are removed. I trust the AF69 control more so than the PCA. We will explore this further with correlation in a few sections below. 
+
+Luis recommended I generate a UMAP for the PCs and plot that, so I will do that below. 
+```{r}
+library(umap)
+
+umap <- umap(pcamat$x)
+
+umap_scores <- as_tibble(umap$layout, rownames = "filename")
+
+#add metadata
+umap_scores <- left_join(umap_scores, metadata, by = "filename")
+
+#relevel infection:
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+```
+
+
+```{r, fig.dim=c(9,5)}
+p_time <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Timepoint_hr, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_donor <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_run <-umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Run, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_flow <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = flow_cell, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_sex <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Sex, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("red", "grey")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_db <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = db, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("red", "blue")) +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_GC <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = perc_GC, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_align <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = perc_Aligned, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_dups <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = perc_Dups, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_ancestry <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = African_admixture, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_age <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Age, shape = Infection)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(values = c(19,4)) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+umap_scores <- mutate(umap_scores, is_AF69 = (Donor_ID == "AF69"))
+
+p_AF69 <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = is_AF69, shape = Run, size = Infection)) +
+  geom_point(alpha = 0.9) +
+  labs(x = "UMAP_1", y = "UMAP_2") +
+  scale_color_manual(values = c("grey", "red")) +
+  scale_shape_manual(values = c(19,4,18,2)) +
+  scale_size_manual(values = c(2,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_time
+p_donor
+p_run
+p_flow
+p_sex
+p_db
+p_GC
+p_align
+p_dups
+p_ancestry
+p_age
+p_AF69
+```
+
+The UMAP tells the same picture as the PCA and it appears that there is a batch effect remaining here, for the Mtb condition specifically, but this UMAP may be misleading as they sometimes can be.
+
+I think the correlation analysis below will tell us the most information we need. 
+
+## Compare correlation between AF69 run and run2
+
+The hypothesis here is that the correlation of AF69 run1 with AF69 run2 should be much higher than the correlation across other samples. 
+
+Compute correlation for AF69 run1 and AF69 run2 across all samples and compare as a ridge plot or histogram. Do for both spearman and pearson. Only look at expressed genes (v_5) and use uncorrected and batch corrected counts. 
+
+Compute correlation matrix
+```{r}
+v_pearson <- cor(v_5$E, method = "pearson")
+v_spearman <- cor(v_5$E, method = "spearman")
+
+v_batchRemoved_pearson <- cor(v_batchRemoved, method = "pearson")
+v_batchRemoved_spearman <- cor(v_batchRemoved, method = "spearman")
+```
+
+make df and get only AF and remove identical comparisons
+```{r}
+v_pearson_df <- as.data.frame(v_pearson) %>% rownames_to_column("filename") %>%
+  pivot_longer(cols = c(2:last_col()), names_to = "filename_2", values_to = "Pearson Correlation") %>% 
+  left_join(metadata, by = "filename") %>% dplyr::filter(Donor_ID == "AF69" & Run == "run1") %>% dplyr::filter(filename != filename_2) %>% 
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr)
+
+v_spearman_df <- as.data.frame(v_spearman) %>% rownames_to_column("filename") %>%
+  pivot_longer(cols = c(2:last_col()), names_to = "filename_2", values_to = "Spearman Correlation") %>% 
+  left_join(metadata, by = "filename") %>% dplyr::filter(Donor_ID == "AF69" & Run == "run1") %>% dplyr::filter(filename != filename_2)%>% 
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr)
+
+v_batchRemoved_pearson_df <- as.data.frame(v_batchRemoved_pearson) %>% rownames_to_column("filename") %>%
+  pivot_longer(cols = c(2:last_col()), names_to = "filename_2", values_to = "Pearson Correlation") %>% 
+  left_join(metadata, by = "filename") %>% dplyr::filter(Donor_ID == "AF69" & Run == "run1") %>% dplyr::filter(filename != filename_2)%>% 
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr)
+
+v_batchRemoved_spearman_df <- as.data.frame(v_batchRemoved_spearman) %>% rownames_to_column("filename") %>%
+  pivot_longer(cols = c(2:last_col()), names_to = "filename_2", values_to = "Spearman Correlation") %>% 
+  left_join(metadata, by = "filename") %>% dplyr::filter(Donor_ID == "AF69" & Run == "run1") %>% dplyr::filter(filename != filename_2)%>% 
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr)
+```
+
+Add filename_2 metadata and select timepoints, so timepoint_1 and timepoint_2 match, then add column of T/F whether samples are identical except run. 
+```{r}
+v_pearson_df <- left_join(v_pearson_df, metadata, by = c("filename_2" = "filename"), suffix = c("_1", "_2")) %>% 
+  dplyr::filter(Timepoint_1 == Timepoint_2) %>% 
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr) %>% 
+  mutate(is_AF69_comparison = case_when(Donor_ID_1 == Donor_ID_2 & Timepoint_1 == Timepoint_2 & Infection_1 == Infection_2 ~ TRUE, .default = FALSE))
+
+v_spearman_df <- left_join(v_spearman_df, metadata, by = c("filename_2" = "filename"), suffix = c("_1", "_2")) %>% 
+  dplyr::filter(Timepoint_1 == Timepoint_2) %>%  
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr) %>% 
+  mutate(is_AF69_comparison = case_when(Donor_ID_1 == Donor_ID_2 & Timepoint_1 == Timepoint_2 & Infection_1 == Infection_2 ~ TRUE, .default = FALSE))
+
+v_batchRemoved_pearson_df <- left_join(v_batchRemoved_pearson_df, metadata, by = c("filename_2" = "filename"), suffix = c("_1", "_2")) %>% 
+  dplyr::filter(Timepoint_1 == Timepoint_2) %>%  
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr) %>% 
+  mutate(is_AF69_comparison = case_when(Donor_ID_1 == Donor_ID_2 & Timepoint_1 == Timepoint_2 & Infection_1 == Infection_2 ~ TRUE, .default = FALSE))
+
+v_batchRemoved_spearman_df <- left_join(v_batchRemoved_spearman_df, metadata, by = c("filename_2" = "filename"), suffix = c("_1", "_2")) %>% 
+  dplyr::filter(Timepoint_1 == Timepoint_2) %>%  
+  dplyr::select(!(flow_cell:last_col()), -Location, -MOI, -Timepoint_hr) %>% 
+  mutate(is_AF69_comparison = case_when(Donor_ID_1 == Donor_ID_2 & Timepoint_1 == Timepoint_2 & Infection_1 == Infection_2 ~ TRUE, .default = FALSE))
+
+```
+
+
+plot
+```{r, fig.dim=c(9,5)}
+df <- v_pearson_df
+obs <- dplyr::filter(df, is_AF69_comparison == TRUE)
+exp <- dplyr::filter(df, is_AF69_comparison == FALSE)
+
+ggplot() +
+  geom_density(data = exp, aes(x = `Pearson Correlation`), fill = "grey", alpha = 0.9) +
+  geom_vline(data = obs, aes(xintercept = `Pearson Correlation`), color = "blue", lwd = 1, binwidth = 0.01) +
+  facet_wrap(~Timepoint_1, ncol = 3) +
+  labs(x = "Pearson Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene Expression Levels between AF69 replicates (blue) and across samples (grey)", 
+       subtitle = "Pearson Correlation: uncorrected voom counts") +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"), 
+        plot.subtitle = element_text(hjust = 0.5, size = 8))
+```
+
+```{r, fig.dim=c(9,5)}
+df <- v_spearman_df
+obs <- dplyr::filter(df, is_AF69_comparison == TRUE)
+exp <- dplyr::filter(df, is_AF69_comparison == FALSE)
+
+ggplot() +
+  geom_density(data = exp, aes(x = `Spearman Correlation`), fill = "grey", alpha = 0.9) +
+  geom_vline(data = obs, aes(xintercept = `Spearman Correlation`), color = "blue", lwd = 1, binwidth = 0.01) +
+  facet_wrap(~Timepoint_1, ncol = 3) +
+  labs(x = "Spearman Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene Expression Levels between AF69 replicates (blue) and across samples (grey)", 
+       subtitle = "Spearman Correlation: uncorrected voom counts") +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"), 
+        plot.subtitle = element_text(hjust = 0.5, size = 8))
+```
+
+```{r, fig.dim=c(9,5)}
+df <- v_batchRemoved_pearson_df
+obs <- dplyr::filter(df, is_AF69_comparison == TRUE)
+exp <- dplyr::filter(df, is_AF69_comparison == FALSE)
+
+ggplot() +
+  geom_density(data = exp, aes(x = `Pearson Correlation`), fill = "grey", alpha = 0.9) +
+  geom_vline(data = obs, aes(xintercept = `Pearson Correlation`), color = "red", lwd = 1, binwidth = 0.01) +
+  facet_wrap(~Timepoint_1, ncol = 3) +
+  labs(x = "Pearson Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene Expression Levels between AF69 replicates (red) and across samples (grey)", 
+       subtitle = "Pearson Correlation: corrected voom counts") +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"), 
+        plot.subtitle = element_text(hjust = 0.5, size = 8))
+```
+
+```{r, fig.dim=c(9,5)}
+df <- v_batchRemoved_spearman_df
+obs <- dplyr::filter(df, is_AF69_comparison == TRUE)
+exp <- dplyr::filter(df, is_AF69_comparison == FALSE)
+
+ggplot() +
+  geom_density(data = exp, aes(x = `Spearman Correlation`), fill = "grey", alpha = 0.9) +
+  geom_vline(data = obs, aes(xintercept = `Spearman Correlation`), color = "red", lwd = 1, binwidth = 0.01) +
+  facet_wrap(~Timepoint_1, ncol = 3) +
+  labs(x = "Spearman Correlation Coefficient", 
+       title = "Pairwise Correlation of Gene Expression Levels between AF69 replicates (red) and across samples (grey)", 
+       subtitle = "Spearman Correlation: corrected voom counts") +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"), 
+        plot.subtitle = element_text(hjust = 0.5, size = 8))
+```
+
+So this show how correcting the voom counts (as is done in the regression) can help remove batch effects. Prior to correction the correlations are not near the top of the distribution, but after being corrected they are. 
+
+To me, this, along with the PCA, gives me confidence that we are correcting for technical confounders properly. 
+
+I will end this notebook here. We discovered the following:
+1. kallisto_14_EU144_T18_Mtb_MOI_5_run1 is a library size outlier and we replaced with kallisto_14_EU144_T16_Mtb_MOI_5_run1 
+2. Filtering low count data by voom-transformed row medians > 1.5 is the best of the three methods tested
+3. The technical confounders to account for when modeling our data (flow_cell + perc_GC + perc_Aligned + perc_Dups (sometimes + Sex))
+4. The correlation analysis and the PCA with AF69 suggest we are accounting fairly well for batch effects and technical confounders.  
+
+The next step is to take these discoveries and apply them to model the data and extract biological understanding. I will do this in "modeling_limma.Rmd". 
+
+
+##
+
+## Session Info
+```{r}
+sessionInfo()
+```

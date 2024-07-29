@@ -1,0 +1,399 @@
+---
+title: "Adjust samples to match timpoint+infection for each donor"
+output: html_notebook
+---
+Author: Tyler Hansen  
+Date: 5.15.24
+
+In order to model the data properly, we need to look at the samples and see how to match timepoint and infection for each donor.
+
+## Setup 
+
+Packages
+```{r, echo=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+```
+
+Load in cts and metadata
+```{r}
+cts <- readRDS("data/filtered_counts_QCd_samples_batch1.rds")
+sample_info <- readRDS("data/metadata_with-covariates_QCd_samples_batch1.rds")
+```
+
+## Are any rows duplicates?
+```{r}
+# Show rows that are duplicates
+sample_info[duplicated(sample_info), ] %>% nrow()
+```
+
+Sweet no duplicates. 
+
+## Make a heatmap of batch1 samples
+Facet by infection, x = donor_id, y = timepoint, value = number of samples
+
+```{r, fig.width=6, fig.height=4}
+#make matrix of values to plot:
+si_subset <- dplyr::select(sample_info , Donor_ID, Timepoint, Infection)
+
+#reverse order of timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+
+#count number of samples, regardless of run
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+
+# Convert n to a factor
+si_subset_count$n <- factor(si_subset_count$n)
+
+heatmap_all_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", linewidth = 0.1) +
+  facet_wrap(~Infection) +
+  ggtitle("RNA-seq samples after QC") +
+  xlab("Individual") +
+  ylab("Timepoint (hours)") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 1,
+        text = element_text(colour = "black"), legend.position = "none", 
+        strip.background = element_rect(fill = "white", color = "grey"), strip.text = element_text(color = "black")) +
+  scale_fill_manual(values = c("snow3", "slateblue"), na.value = 'grey')
+heatmap_all_samples
+
+ggsave(heatmap_all_samples, filename = "results/batch1_only/QCd_sample_heatmap_preDuplication.pdf", device = cairo_pdf, width = 6, height = 4)
+```
+
+We face two moderate problems:
+1) Not all timepoints have NI samples. 
+2) Some samples are missing. 
+
+## Duplicate NI samples
+Since our downstream analyses are timepoint by timepoint, we will address issue 1 by duplicating NI to the nearest Mtb timepoints. 
+
+Specifically we will do this:
+  T0 --> T1/T2
+  T4 --> T3/T5/T6
+  T8 --> T7/T9
+  T12 --> T10/T14
+  T18 --> T16
+  T48 --> T42
+
+Function for duplicating timepoints
+```{r}
+duplicate_timepoints <- function(si, reference_t, assigned_t, counts) {
+  #extract the desired timepoint
+  tmp <- dplyr::filter(si, Infection == "NI" & Timepoint == reference_t)
+  
+  #change to new timepoint
+  tmp <- mutate(tmp, Timepoint = assigned_t)
+  
+  #change rownames so there are no dupliicates
+  rnames <- rownames(tmp)
+  rownames(tmp) <- paste0("duplicated_", rnames)
+  
+  #add back to si
+  si <- bind_rows(si, tmp)
+  
+  #now adjust counts with for loop over rnames. Duplicate sample with rname and add duplicated to it. 
+  counts <- as.data.frame(counts)
+  for (sample in rnames) {
+    dup_sample <- paste0("duplicated_", sample)
+    counts[,dup_sample] <- counts[, sample]
+    rm(dup_sample)
+  }
+  
+  #this should work, but stop if si and counts are not equivalent. If 
+  if (all(colnames(counts) == rownames(si))) {
+    res <- list(counts, si)
+    return(res)
+  }
+  else {
+    stop("Sample info and counts are not equivalent after operation")
+  }
+}
+```
+
+T0 --> T1
+```{r}
+adjusted <- duplicate_timepoints(si = sample_info , reference_t = "T0", assigned_t = "T1", counts = cts)
+```
+
+T0 --> T1 --> T2
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T1", assigned_t = "T2", counts = adjusted[[1]])
+```
+
+T4 --> T3
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T4", assigned_t = "T3", counts = adjusted[[1]])
+```
+
+T4 --> T3 --> T5
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T3", assigned_t = "T5", counts = adjusted[[1]])
+```
+
+T4 --> T3 --> T5 --> T6
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T5", assigned_t = "T6", counts = adjusted[[1]])
+```
+
+T8 --> T7
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T8", assigned_t = "T7", counts = adjusted[[1]])
+```
+
+T8 --> T7 --> T9
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T7", assigned_t = "T9", counts = adjusted[[1]])
+```
+
+T12 --> T10
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T12", assigned_t = "T10", counts = adjusted[[1]])
+```
+
+T12 --> T10 --> T14
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T10", assigned_t = "T14", counts = adjusted[[1]])
+```
+
+T18 --> T16
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T18", assigned_t = "T16", counts = adjusted[[1]])
+```
+
+T48 --> T42
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T48", assigned_t = "T42", counts = adjusted[[1]])
+```
+
+Extract cts and si.
+```{r}
+cts <- adjusted[[1]]
+sample_info  <- adjusted[[2]]
+```
+
+Plot new heatmap. 
+```{r, fig.width=6, fig.height=4}
+#prepare for heatmap
+si_subset <- dplyr::select(sample_info , Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+#heatmap
+heatmap_duplicated_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", linewidth = 0.1) +
+  facet_wrap(~Infection) +
+  ggtitle("RNA-seq samples after QC and NI duplication") +
+  xlab("Individual") +
+  ylab("Timepoint (hours)") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 1,
+        text = element_text(colour = "black"), legend.position = "none", 
+        strip.background = element_rect(fill = "white", color = "grey"), strip.text = element_text(color = "black")) +
+  scale_fill_manual(values = c("snow3", "slateblue"), na.value = 'grey')
+heatmap_duplicated_samples
+
+ggsave(heatmap_duplicated_samples, filename = "results/batch1_only/QCd_sample_heatmap_NI_Duplicated.pdf", device = cairo_pdf, width = 6, height = 4)
+```
+
+This looks great. We now have the more difficult issue of missing data. 
+
+## Duplicate the nearest timepoint for missing NI samples
+
+I assume that NI samples should not vary much across time. We can therefore duplicate the nearest NI timepoint within the donor. 
+
+AF95/NI: T14 --> T16
+AF95/NI: T14 --> T16 --> T18
+EU144/NI: T6 --> T2 #we want T6 because this was the last point that was duplicated and using T3 or T4 would have duplicate rownames. In other words, T6 is T4. 
+EU144/NI: T6 --> T2 --> T1
+EU144/NI: T6 --> T2 --> T1 --> T0
+
+
+```{r}
+duplicate_timepoints_2 <- function(si, reference_t, assigned_t, counts, condition, donor) {
+  #extract the desired timepoint
+  tmp <- dplyr::filter(si, Infection == condition & Timepoint == reference_t & Donor_ID == donor)
+  
+  #change to new timepoint
+  tmp <- mutate(tmp, Timepoint = assigned_t)
+  
+  #change rownames so there are no dupliicates
+  rnames <- rownames(tmp)
+  rownames(tmp) <- paste0("duplicated_", rnames)
+  
+  #add back to si
+  si <- bind_rows(si, tmp)
+  
+  #now adjust counts with for loop over rnames. Duplicate sample with rname and add duplicated to it. 
+  counts <- as.data.frame(counts)
+  for (sample in rnames) {
+    dup_sample <- paste0("duplicated_", sample)
+    counts[,dup_sample] <- counts[, sample]
+    rm(dup_sample)
+  }
+  #this should work, but stop if si and counts are not equivalent. If 
+  if (all(colnames(counts) == rownames(si))) {
+    res <- list(counts, si)
+    return(res)
+  }
+  else {
+    stop("Sample info and counts are not equivalent after operation")
+  }
+}
+```
+
+```{r}
+#AF95/NI: T14 --> T16
+adjusted_2 <- duplicate_timepoints_2(si = sample_info , counts = cts, reference_t = "T14", assigned_t = "T16", condition = "NI", donor = "AF95")
+
+#AF95/NI: T14 --> T16 --> T18
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T16", assigned_t = "T18", condition = "NI", donor = "AF95")
+
+#EU144/NI: T6 --> T2
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T6", assigned_t = "T2", condition = "NI", donor = "EU144")
+
+#EU144/NI: T6 --> T2 --> T1
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T2", assigned_t = "T1", condition = "NI", donor = "EU144")
+
+#EU144/NI: T6 --> T2 --> T1 --> T0
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T1", assigned_t = "T0", condition = "NI", donor = "EU144")
+```
+
+Extract cts and si. Plot new heatmap. 
+```{r}
+cts <- adjusted_2[[1]]
+sample_info  <- adjusted_2[[2]]
+```
+
+```{r, fig.width=6, fig.height=4}
+#prepare for heatmap
+si_subset <- dplyr::select(sample_info , Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+#heatmap
+heatmap_NI_filled_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", linewidth = 0.1) +
+  facet_wrap(~Infection) +
+  ggtitle("RNA-seq samples after QC and NI duplication") +
+  xlab("Individual") +
+  ylab("Timepoint (hours)") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 1,
+        text = element_text(colour = "black"), legend.position = "none", 
+        strip.background = element_rect(fill = "white", color = "grey"), strip.text = element_text(color = "black")) +
+  scale_fill_manual(values = c("snow3", "slateblue"), na.value = 'grey')
+heatmap_NI_filled_samples
+
+ggsave(heatmap_NI_filled_samples, filename = "results/batch1_only/QCd_sample_heatmap_NI_Duplicated_NI-filled.pdf", device = cairo_pdf, width = 6, height = 4)
+```
+
+## Remove the matching NI condition/donor for missing Mtb samples
+
+Unlike NI, I think it is a poor assumption to assume that Mtb samples will not vary much across time. Therefore, I think it maybe misleading if we were to duplicate the Mtb sample. 
+
+Instead, lets remove the matching NI sample for the two missing points. This should not effect modeling for timepoint-specific ancestry or infection effects, other than reducing power a bit for timepoints T14 and T18. 
+
+Remove: 
+AF193/NI/T14
+EU144/NI/T18
+
+```{r}
+sample_info <- dplyr::filter(sample_info, !(Infection == "NI" & Timepoint == "T14" & Donor_ID == "AF193")) %>%
+  dplyr::filter(!(Infection == "NI" & Timepoint == "T18" & Donor_ID == "EU144"))
+```
+
+Square with cts. Plot new heatmap. 
+```{r}
+cts <- cts[,rownames(sample_info)]
+```
+
+```{r, fig.width=6, fig.height=4}
+#prepare for heatmap
+si_subset <- dplyr::select(sample_info , Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+#heatmap
+heatmap_final_samples_T0 <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", linewidth = 0.1) +
+  facet_wrap(~Infection) +
+  ggtitle("RNA-seq samples after QC and NI duplication") +
+  xlab("Individual") +
+  ylab("Timepoint (hours)") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 1,
+        text = element_text(colour = "black"), legend.position = "none", 
+        strip.background = element_rect(fill = "white", color = "grey"), strip.text = element_text(color = "black")) +
+  scale_fill_manual(values = c("snow3", "slateblue"), na.value = 'grey')
+heatmap_final_samples_T0
+
+ggsave(heatmap_final_samples_T0, filename = "results/batch1_only/QCd_sample_heatmap_final_samples_withT0.pdf", device = cairo_pdf, width = 6, height = 4)
+```
+
+## Remove NI T0 samples and save both versions
+When modeling we will not need T0 and it could be confounding, so remove that timepoint. It may be useful to plot though, so lets keep it as and RDS. 
+
+Reset timepoint_hr column
+```{r}
+sample_info  <- mutate(sample_info, Timepoint_hr = as.numeric(str_remove(Timepoint, "T"))) %>%
+  relocate(Timepoint_hr, .after = Timepoint)
+```
+
+Save with T0
+```{r}
+saveRDS(sample_info , file = "data/filtered_counts_final_batch1_withT0.rds")
+saveRDS(cts, file = "data/metadata_final_batch1_withT0.rds")
+```
+
+Remove T0
+```{r}
+sample_info <- dplyr::filter(sample_info , Timepoint != "T0")
+cts <- cts[, row.names(sample_info )]
+```
+
+Plot
+```{r, fig.width=6, fig.height=4}
+#prepare for heatmap
+si_subset <- dplyr::select(sample_info , Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+#heatmap
+heatmap_final_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", linewidth = 0.1) +
+  facet_wrap(~Infection) +
+  ggtitle("RNA-seq samples after QC and NI duplication") +
+  xlab("Individual") +
+  ylab("Timepoint (hours)") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 1,
+        text = element_text(colour = "black"), legend.position = "none", 
+        strip.background = element_rect(fill = "white", color = "grey"), strip.text = element_text(color = "black")) +
+  scale_fill_manual(values = c("snow3", "slateblue"), na.value = 'grey')
+heatmap_final_samples
+
+ggsave(heatmap_final_samples, filename = "results/batch1_only/QCd_sample_heatmap_final_samples.pdf", device = cairo_pdf, width = 6, height = 4)
+```
+
+Adjust factor levels before saving. 
+```{r}
+#before, adjust factors to remove levels that were removed
+sample_info$flow_cell <- factor(as.character(sample_info$flow_cell))
+sample_info$Donor_ID <- factor(as.character(sample_info$Donor_ID))
+sample_info$Timepoint <- factor(sample_info$Timepoint, levels = c("T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48"))
+```
+
+Save without T0
+```{r}
+saveRDS(cts, file = "data/filtered_counts_final_batch1.rds")
+saveRDS(sample_info, file = "data/metadata_final_batch1.rds")
+```

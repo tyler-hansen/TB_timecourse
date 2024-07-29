@@ -1,0 +1,6 @@
+---
+title: "DEA of early timepoint Non-infected samples"
+output: html_notebook
+---
+
+Between batches, we have different non-infected timepoints for the early section of the time-course. We believe that it should be okay to use these early timepoint interchangably, such that T0 and T1 are equivalent. We also have T3 and T5 for run2 but only T4 for run3. We are thinking we could use T4 as the T3 and T5 timepoint. However we need to test that they are the same. There are two ways to do this. Comparison of 1) correlations 2) number of differentially expressed genes. 

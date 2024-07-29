@@ -1,0 +1,15 @@
+Duplicate directories found:
+kallisto_6_AF661_T1_NI found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_11_EU262_T5_Flu_MOI_0.1 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_9_EU126_T24_Mtb_MOI_5 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_1_AF31_T5_Mtb_MOI_5 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_10_EU233_T3_Flu_MOI_0.1 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_8_AF854_T3_Mtb_MOI_5 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_8_AF854_T24_Mtb_MOI_5 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_11_EU262_T1_Flu_MOI_0.1 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_2_AF53_T8_Mtb_MOI_5 found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_1_AF31_T3_NI found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_14_AF69_T5_NI found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_7_AF781_T8_NI found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_6_AF661_T5_NI found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/
+kallisto_1_AF31_T5_NI found in: ../data/kallisto_samples_run2/ ../data/kallisto_samples_run3/

@@ -1,0 +1,263 @@
+---
+title: "Flu-NI_mixup-test"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 5.14.2024
+
+
+Tyler Hansen - 05.14.2024
+
+We have pretty bad batch effects where batch 2 is all responding for the NI condition. This is very strange and possibly there was contamination with mycobacterrium. 
+
+It is also possible that the NI and the flu samples were mixed up. I want to test that by comparing samples in PCA space as well as immune response genes. 
+
+To make things simple, just look at batch2 runs 2 and 3 for IAV, Mtb, and NI infection conditions. 
+
+## Step 1: Convert kallisto transript level to gene level and join samples
+
+We have transcript level data in kallisto files. We need and want to work with TPM at the gene level. This notebook describes converting transcript level to gene level for all relevant files. In addition, in the tximport call, we join all samples and output the converted counts as a dataframe. 
+
+We only want to join the batch 2 samples for NI, Mtb, and Flu. Since run4 is not many samples just do run 2 and 3. 
+
+```{r, Libraries, echo=FALSE}
+library(tidyverse)
+library(GenomicFeatures)
+library(tximport)
+library(rhdf5)
+library(limma)
+library(edgeR)
+```
+
+Read in sample info for tb, ni, and flu samples for batch2 only and tidy.
+```{r}
+#set colnames
+CN <- c("kallisto_number", "Donor_ID", "Timepoint", "Infection", "MOI", "Location", "Run", "filename", "sample_ID") #column names
+
+#read in metadata
+sample_info_tb <- read_tsv("data/metadata.tsv", col_names = CN)
+sample_info_flu <- read_tsv("data/metadata_flu.tsv", col_names = CN)
+
+#join
+sample_info <- bind_rows(sample_info_tb, sample_info_flu)
+
+#drop run1 and run4, remove MOI, location, sample_ID, kallisto columns
+sample_info <- dplyr::filter(sample_info, Run %in% c("run2", "run3")) %>% dplyr::select(-MOI, -Location, -sample_ID, -kallisto_number)
+```
+
+Now assign files to select using sample info. 
+```{r}
+#kallisto files. This uses the filename to match the metadata to the counts
+files <- file.path("data/kallisto_all/", sample_info$filename, "abundance.h5")
+names(files) <- sample_info$filename
+```
+
+Get gene-level information for converting transcript to gene. 
+```{r, make ts2gene object}
+txdb <- makeTxDbFromGFF("data/Homo_sapiens.GRCh38.87.gtf",format='gtf')
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+```
+
+Use tximpport to collect gene-level lengthScaledTPM for each file into a combine file
+```{r}
+# Gene-level lengthScaledTPM
+txi.kallisto.gene_level.lengthScaledTPM <- tximport(files, type = "kallisto", txOut = FALSE, 
+                                                    tx2gene=tx2gene, countsFromAbundance= 'lengthScaledTPM')
+```
+Conver to dataframe
+```{r}
+cts <- as.data.frame(txi.kallisto.gene_level.lengthScaledTPM$counts)
+rownames(cts) <- row.names(txi.kallisto.gene_level.lengthScaledTPM$counts)
+```
+
+## Step 2: Filter genes
+
+1. Extract only the protein coding genes
+```{r}
+#read in genes
+gtf <- rtracklayer::readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+
+#extract protein coding genes. I checked and this entire pipe works. 
+pc_gene_ids <- plyranges::filter(gtf, type == 'gene', gene_biotype == 'protein_coding') %>% as.data.frame() %>% dplyr::select(gene_id, gene_name)
+
+#select rows that match the protein coding gene
+filtered_cts_pc_only <- cts[pc_gene_ids$gene_id, ]
+
+#verify this worked - both of these should print TRUE
+all(rownames(filtered_cts_pc_only) == pc_gene_ids$gene_id)
+nrow(filtered_cts_pc_only) == nrow(pc_gene_ids)
+```
+
+Since we have the symbol and ensembl ids now, merge them together and set as rownames. 
+```{r}
+pc_gene_ids[, 3] <- unite(pc_gene_ids, "merged_id", gene_id:gene_name, sep = "_")
+rownames(filtered_cts_pc_only) <- pc_gene_ids$merged_id
+```
+
+2. remove low count data by voom-transformed row medians > 1.5
+```{r}
+#set up dgelist
+tmp <- DGEList(filtered_cts_pc_only)
+#calculate norm factors
+tmp <- calcNormFactors(tmp)
+#voom transform, this requires a design, which can be ~1. This gives the same genes below if a real model is used (I checked). 
+tmp_design <- model.matrix(~1, data = sample_info)
+tmp <- voom(tmp, tmp_design, plot = F)
+
+#filter genes based on voom-transformed row medians > 1.5. This is equivalent to 10^1.5 = 31.6 raw counts. This is much more stringent.  
+keep <- data.frame(medians = apply(tmp$E, 1, median)) %>% dplyr::filter(medians > 1.5)
+filtered_cts <- filtered_cts_pc_only[row.names(keep), ]
+
+#remove tmp objects
+rm(tmp, tmp_design)
+
+#report how much was lost
+print('total features remaining')
+nrow(filtered_cts)
+print('total features removed') 
+nrow(filtered_cts_pc_only) - nrow(filtered_cts)
+```
+
+## Step 3: Remove poor quality samples
+
+Voom transform
+```{r}
+#set up dgelist
+dge <- DGEList(filtered_cts)
+#calculate norm factors
+dge <- calcNormFactors(dge)
+#voom transform, this requires a design, which can be ~1. This gives the same genes below if a real model is used (I checked). 
+base_design <- model.matrix(~1, data = sample_info)
+v <- voom(dge, base_design, plot = F)
+```
+
+Plot library size
+```{r}
+lib <- dge$samples %>% as.data.frame()
+
+ggplot(data=lib, aes(x=log10(lib.size))) +
+    geom_histogram(binwidth = 0.05, color = "grey", fill = "ivory") +
+    geom_jitter(color = "black", alpha = 0.5, aes(y = 0), height = 5) +
+    theme_bw() +
+    ylab("count") +
+    theme(legend.position = "none")
+```
+
+This actually looks pretty good. 
+
+Lets look at count distributions:
+
+Create df of voom counts with gene, sample, and counts as columns
+```{r}
+voom_counts_df <- as.data.frame(v$E) %>% rownames_to_column("gene_id") %>% 
+  pivot_longer(cols = -gene_id, names_to = "Sample", values_to = "counts")
+```
+
+Plot
+```{r}
+vc_dist <- ggplot(voom_counts_df, aes(x=counts, group=Sample, color=Sample)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+vc_dist
+```
+
+Awesome, this looks really good. 
+
+## Step 4: PCA
+
+Calculate PCs
+```{r}
+mat <- as.matrix(v$E) %>% t()
+pcamat <- prcomp(mat)
+```
+
+Plot variance explained by top 20 PCAs
+```{r}
+#variance explained by PCs
+pc_eigenvalues <- pcamat$sdev^2
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), variance = pc_eigenvalues) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+
+ggplot(pc_eigenvalues , aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + coord_cartesian(xlim = c(0,20))
+```
+
+PC1 and PC2 explains a lot, but it looks like PCs1-5 contribute a notable amount as well.  
+
+Plot PC1 and PC2 and use color/point type for variables
+```{r, fig.dim=c(9,5)}
+#Prepare df for plotting, just select the first 10 PCs
+pc_scores <- as.data.frame(pcamat$x)[, 1:10] %>% rownames_to_column(var = "filename")
+
+#add metadata
+pc_scores <- left_join(pc_scores, sample_info, by = "filename")
+
+#relevel infection:
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb", "Flu")))
+pc_scores$Timepoint <- factor(pc_scores$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"))
+```
+
+Plot PC1 vs. PC2 and annotate with infection and time
+```{r, fig.height=6, fig.width=6.5}
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_d(option = "rocket") +
+  scale_shape_manual(values = c(19,17,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_time
+```
+
+This makes it look like Flu has an effect. Just plot same shape and color by infection. 
+
+Plot PC1 vs. PC2 and annotate with infection and time
+```{r, fig.height=6, fig.width=6.5}
+p_infection <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Dark2") +
+  theme_minimal() +
+  theme(text = element_text(colour = "black"))
+
+p_infection
+```
+
+
+## Step 5: immune response genes over time
+
+Okay now lets look at immune response genes over time. 
+```{r, fig.height=8, fig.width=10}
+#convert voom table to long format and add metadata and convert gene_id to symbol (I did this above previously in a clearer way).
+top_v <- v$E %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% 
+  pivot_longer(cols = !gene_id, names_to = "filename", values_to = "voom_cts") %>% 
+  left_join(sample_info, by = "filename") %>%
+  mutate(symbol = str_split_i(gene_id, pattern = "_", i = 2))
+
+#select the genes we care about:
+top_v <- filter(top_v, symbol %in% c("TNF", "IL6", "IL1B"))
+
+#relevel
+top_v$Infection <- factor(top_v$Infection, levels = c("NI", "Mtb", "Flu"))
+top_v$Timepoint <- factor(top_v$Timepoint, levels = c("T1", "T3", "T5", "T8", "T12", "T18", "T24", "T30", "T36", "T48"))
+
+#combine:
+ggplot(top_v, aes(x = Timepoint, y = voom_cts)) +
+  geom_boxplot(aes(fill = Infection), alpha = 0.5, outlier.size = 0) +
+  geom_jitter(aes(color = Infection), alpha = 0.5) +
+  facet_grid(rows = vars(Infection), cols = vars(symbol)) +
+  labs(title = "voom normalized counts of batch samples for select immune\nresponse genes stratified by condition") +
+  scale_fill_manual(values = c("limegreen", "mediumpurple", "royalblue")) +
+  scale_color_manual(values = c("limegreen", "mediumpurple", "royalblue")) +
+  theme_bw()
+```
+
+So it looks like there is a response in all three conditions. It was worth a shot but it simply is not a mix up of flu and non-infected. 

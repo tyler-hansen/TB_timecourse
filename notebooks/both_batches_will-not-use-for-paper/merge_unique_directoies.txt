@@ -1,0 +1,80 @@
+11.15.2023 - Tyler Hansen
+
+I wrote a script (find_duplicate_kallisto_directories) to identify duplicate directories across the 4 kallisto runs. I wrote the output to OUTPUT_find_duplicate_kallisto_directories.txt. 
+
+Only duplicates are in the 2 and 3 runs. For those use the run3 samples. Do not use the run2 samples for those. To do this, I saved the folder names as run2_duplicates.txt and ran the script remove_duplicate_directories.sh to delete the directories.
+
+The following was the output: 
+Removing directory: kallisto_6_AF661_T1_NI
+Removing directory: kallisto_11_EU262_T5_Flu_MOI_0.1
+Removing directory: kallisto_9_EU126_T24_Mtb_MOI_5
+Removing directory: kallisto_1_AF31_T5_Mtb_MOI_5
+Removing directory: kallisto_10_EU233_T3_Flu_MOI_0.1
+Removing directory: kallisto_8_AF854_T3_Mtb_MOI_5
+Removing directory: kallisto_8_AF854_T24_Mtb_MOI_5
+Removing directory: kallisto_11_EU262_T1_Flu_MOI_0.1
+Removing directory: kallisto_2_AF53_T8_Mtb_MOI_5
+Removing directory: kallisto_1_AF31_T3_NI
+Removing directory: kallisto_14_AF69_T5_NI
+Removing directory: kallisto_7_AF781_T8_NI
+Removing directory: kallisto_6_AF661_T5_NI
+Removing directory: kallisto_1_AF31_T5_NI
+
+The next step is to transfer just the TB-relevant directories. I will do this tomorow. I did transfer all of run1 to kallisto_TB-relevant since all of run1 was relevant. In doing that, I appended _run to each file with the following code:
+
+> for file in kallisto_samples/*; do
+>     mv "$file" "kallisto_TB-relevant/$(basename "$file")_run1"
+> done
+
+11.17.2023 - Tyler Hansen
+To move everything TB related from run 2/3/4, I did a mv with *Mtb* and *NI* wildcards.
+
+I'm so dumb. I forgot to add the run2 3 4 tags to each directory before moving. I will remove, redownload from midway, repeat the run2 removal process and move over with the follwoing code:
+
+> for file in kallisto_samples_run2/*Mtb*; do
+>     mv "$file" "kallisto_TB-relevant/$(basename "$file")_run2"
+> done
+
+> for file in kallisto_samples_run2/*NI*; do
+>     mv "$file" "kallisto_TB-relevant/$(basename "$file")_run2"
+> done  
+
+> for file in kallisto_samples_run3/*Mtb*; do
+>     mv "$file" "kallisto_TB-relevant/$(basename "$file")_run3"
+> done
+
+> for file in kallisto_samples_run3/*NI*; do
+>     mv "$file" "kallisto_TB-relevant/$(basename "$file")_run3"
+> done
+
+> for file in kallisto_samples_run4/*Mtb*; do
+>     mv "$file" "kallisto_TB-relevant/$(basename "$file")_run4"
+> done
+
+> for file in kallisto_samples_run4/*NI*; do
+>     mv "$file" "kallisto_TB-relevant/$(basename "$file")_run4"
+> done
+
+I did this and it worked well. Next it is onto collecting metadata, which should be easy to do since it is in the filenames. I will record this in a new notebook.
+
+12.1.22
+Okay so Luis wants to use both the run2 and run3 fastq files for the resequenced samples. After looking at the fastqc for run2, the following samples were bad and should NOT be combined between 2 and 3, only use 3: kallisto_1_AF31_T5_NI kallisto_1_AF31_T3_NI kallisto_14_AF69_T5_NI. All others combine:
+
+kallisto_6_AF661_T1_NI
+kallisto_11_EU262_T5_Flu_MOI_0.1
+kallisto_9_EU126_T24_Mtb_MOI_5
+kallisto_10_EU233_T3_Flu_MOI_0.1
+kallisto_8_AF854_T3_Mtb_MOI_5
+kallisto_8_AF854_T24_Mtb_MOI_5
+kallisto_11_EU262_T1_Flu_MOI_0.1
+kallisto_2_AF53_T8_Mtb_MOI_5
+kallisto_7_AF781_T8_NI
+kallisto_6_AF661_T5_NI
+
+To do this, move the trimmed fastq files from each to my local computer, merge with samtools and run kallisto. 
+
+I also need to remove the bad files from run1. I should also check for overlaps between bad files in 1 and 2,3,4. Also should try to understand what is going on with run4 samples. I will do this next week. 
+
+12.8.2023
+
+Okay we met with Luis and decided to remove all run4 samples and only use samples with timepoints for all individuals. In a seperate notebook, I will detail this.  

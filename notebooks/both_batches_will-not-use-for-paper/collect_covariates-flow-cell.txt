@@ -1,0 +1,10 @@
+Tyler Hansen - 12.12.2023
+
+To collect flow cell id's from each run, I ran the following function on all run2,3,4 directories: 
+
+for file in *.fq*; do basename $file >> ../../../tyler/TB_timecourse/results/run2_flow-cell.txt ; zcat $file | head -n 1 >> ../../../tyler/TB_timecourse/results/run2_flow-cell.txt ; done
+
+All of run3 were on one flow cell. 
+All of run4 were on one flow cell. 
+
+Run2 was on multiple flow cells. I further processed this file in R, where in collect_covariates.Rmd I converted it into a table and selected the flow cell id, then simplified that. 

@@ -1,0 +1,424 @@
+---
+title: "Generate Metadata Heatmaps"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen  
+Date: 11.17.2023 | Update 12.7.2023
+
+From processes I did in bash, I prepared a tsv of metadata information from file names. I will load in the tsv to summarise and build visuals of the data structure. 
+```{r, libraries, message=FALSE}
+library(tidyverse)
+library(extrafont)
+loadfonts(device = "win")
+```
+
+```{r}
+CN <- c("kallisto_number", "Donor_ID", "Timepoint", "Infection(TB/NI)", "MOI", "Location", "Run", "filename", "sample_ID") #column names
+md <- read_tsv("results/metadata.tsv", col_names = CN)
+
+head(md)
+```
+Okay, I checked the md tibble and everything read in properly. There are 668 rows, i.e. 668 samples to analyze. 
+
+First question is are any rows duplicates?
+```{r}
+# Check for duplicate rows
+duplicate_rows <- md %>% duplicated()
+ 
+# Show rows that are duplicates
+md[duplicate_rows, ] 
+
+```
+
+Sweet no duplicates. 
+
+Now plot a heatmap matrix of individuals by timepoint and the number of samples for that. Like what Haley had done before. 
+
+```{r}
+#make matrix of values to plot:
+tp_donor_count <- count(md, Donor_ID, Timepoint)
+
+#adjust factor levels so timepoints are in order (donors are pretty good already):
+tp_donor_count$Timepoint <- factor(tp_donor_count$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+tp_donor_count
+```
+
+```{r}
+# Convert n to a factor
+tp_donor_count$n <- factor(tp_donor_count$n)
+
+#plot as heatmap:
+p <- ggplot(tp_donor_count, x=Donor_ID) +
+  geom_tile(aes(x=Donor_ID, y=Timepoint, fill = n), colour="white", size=0.2) +
+  geom_text(aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  labs(fill = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), legend.position = "none", text = element_text(family = "Calibri", colour = "black")) +
+  scale_fill_brewer(palette = "Blues")
+p
+
+#save
+ggsave(p, device = cairo_pdf, filename = "results/metadata_heatmap_timepoint-vs-donor.pdf")
+```
+Okay so we know the overall stucture, but it isn't clear whether 2 is NI and MtB or NI and Mtb. Expand to include additional info.  
+
+```{r}
+#make matrix of values to plot:
+tp_four <- data.frame("Donor_ID" = md$Donor_ID, "Timepoint" = md$Timepoint, "Infection" = md$`Infection(TB/NI)`, "Batch" = md$Run)
+
+#count number of samples, regardless of run
+tp_three <- count(tp_four, Donor_ID, Timepoint, Infection)
+
+#adjust factor levels so timepoints and Infection are in order (donors are pretty good already):
+tp_four$Timepoint <- factor(tp_four$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+
+tp_four$Infection <- factor(tp_four$Infection, levels = c("NI", "Mtb"))
+
+tp_four$Batch <- factor(tp_four$Batch, levels = c("run1", "run2", "run3", "run4"))
+
+# Convert n to a factor
+tp_three$n <- factor(tp_three$n)
+
+tp_four
+tp_three
+```
+```{r}
+p <- ggplot() +
+  geom_tile(data = tp_four, aes(x=Donor_ID, y=Timepoint, fill = Batch), color = "white", size=0.2) +
+  geom_text(data = tp_three, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(family = "Calibri", colour = "black")) +
+  ggsci::scale_fill_npg(alpha = 0.5)
+p
+```
+Remove the bad data and repeat:
+
+For Run1, these are: 
+kallisto_6_AF145_T0_NI_run1
+kallisto_6_AF145_T0_Mtb_MOI_5_run1
+kallisto_6_AF145_T12_NI_run1
+kallisto_6_AF145_T12_Mtb_MOI_5_run1
+kallisto_6_AF145_T18_NI_run1
+kallisto_6_AF145_T18_Mtb_MOI_5_run1
+kallisto_6_AF145_T24_NI_run1
+kallisto_6_AF145_T24_Mtb_MOI_5_run1
+kallisto_6_AF145_T48_NI_run1
+kallisto_6_AF145_T48_Mtb_MOI_5_run1
+kallisto_8_AF183_T0_Mtb_MOI_5_run1
+kallisto_9_AF193_T0_Mtb_MOI_5_run1
+kallisto_3_AF55_T0_Mtb_MOI_5_run1
+kallisto_4_AF69_T0_Mtb_MOI_5_run1
+kallisto_5_AF95_T0_Mtb_MOI_5_run1
+kallisto_5_AF95_T18_NI_run1
+kallisto_17_EU02_T0_Mtb_MOI_5_run1
+kallisto_18_EU03_T0_Mtb_MOI_5_run1
+kallisto_10_EU118_T0_Mtb_MOI_5_run1
+kallisto_12_EU122_T0_Mtb_MOI_5_run1
+kallisto_13_EU140_T0_Mtb_MOI_5_run1
+kallisto_14_EU144_T0_Mtb_MOI_5_run1
+kallisto_15_EU148_T0_Mtb_MOI_5_run1
+kallisto_16_EU238_T0_Mtb_MOI_5_run1
+
+For Run2, these are: 
+14_AF69_T5_NI_S118_L002_R1_001
+1_AF31_T3_NI_S41_L001_R1_001
+1_AF31_T5_NI_S80_L001_R1_001
+
+Note: Run 2 was already removed
+
+```{r}
+md_clean <- filter(md, !filename %in% c("kallisto_6_AF145_T0_NI_run1","kallisto_6_AF145_T0_Mtb_MOI_5_run1","kallisto_6_AF145_T12_NI_run1",
+"kallisto_6_AF145_T12_Mtb_MOI_5_run1",
+"kallisto_6_AF145_T18_NI_run1",
+"kallisto_6_AF145_T18_Mtb_MOI_5_run1",
+"kallisto_6_AF145_T24_NI_run1",
+"kallisto_6_AF145_T24_Mtb_MOI_5_run1",
+"kallisto_6_AF145_T48_NI_run1",
+"kallisto_6_AF145_T48_Mtb_MOI_5_run1",
+"kallisto_8_AF183_T0_Mtb_MOI_5_run1",
+"kallisto_9_AF193_T0_Mtb_MOI_5_run1",
+"kallisto_3_AF55_T0_Mtb_MOI_5_run1",
+"kallisto_4_AF69_T0_Mtb_MOI_5_run1",
+"kallisto_5_AF95_T0_Mtb_MOI_5_run1",
+"kallisto_5_AF95_T18_NI_run1",
+"kallisto_17_EU02_T0_Mtb_MOI_5_run1",
+"kallisto_18_EU03_T0_Mtb_MOI_5_run1",
+"kallisto_10_EU118_T0_Mtb_MOI_5_run1",
+"kallisto_12_EU122_T0_Mtb_MOI_5_run1",
+"kallisto_13_EU140_T0_Mtb_MOI_5_run1",
+"kallisto_14_EU144_T0_Mtb_MOI_5_run1",
+"kallisto_15_EU148_T0_Mtb_MOI_5_run1",
+"kallisto_16_EU238_T0_Mtb_MOI_5_run1"))
+
+md_clean <- filter(md_clean, !filename %in% c("kallisto_14_AF69_T5_NI_run2", "kallisto_1_AF31_T3_NI_run2", "kallisto_1_AF31_T5_NI_run2"))
+```
+
+```{r}
+#make matrix of values to plot:
+four <- data.frame("Donor_ID" = md_clean$Donor_ID, "Timepoint" = md_clean$Timepoint, 
+                   "Infection" = md_clean$`Infection(TB/NI)`, "Batch" = md_clean$Run)
+
+#count number of samples, regardless of run
+three <- count(four, Donor_ID, Timepoint, Infection)
+
+#adjust factor levels so timepoints and Infection are in order (donors are pretty good already):
+four$Timepoint <- factor(four$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+
+four$Infection <- factor(four$Infection, levels = c("NI", "Mtb"))
+
+four$Batch <- factor(four$Batch, levels = c("run1", "run2", "run3", "run4"))
+
+# Convert n to a factor
+three$n <- factor(three$n)
+
+four
+three
+```
+```{r}
+p <- ggplot() +
+  geom_tile(data = four, aes(x=Donor_ID, y=Timepoint, fill = Batch), color = "white", size=0.2) +
+  geom_text(data = three, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(family = "Calibri", colour = "black")) +
+  ggsci::scale_fill_nejm(alpha = 0.5)
+p
+```
+This still includes the samples that were resequenced, and is therefore a bit confounding. Remove those, showing just run3 for run2+run3 samples. 
+
+Actually, these are already removed. 
+
+```{r}
+md_cleaner <- filter(md_clean, !filename %in% c("kallisto_2_AF53_T8_Mtb_run2", "kallisto_6_AF661_T1_NI_run2",
+                                                "kallisto_6_AF661_T5_NI_run2", "kallisto_7_AF781_T8_NI_run2", 
+                                                "kallisto_8_AF854_T24_Mtb_run2", "kallisto_8_AF854_T3_Mtb_run2", 
+                                                "kallisto_9_EU126_T24_Mtb_run2"))
+nrow(md_cleaner)
+```
+### Post-Luis Conversation
+
+After discussing with Luis, we are going to only use samples with timepoints for all individuals. This means droping the following timepoints: T2, T6, T7, T9, T10, T14, T16, T42. We are also dropping T48 because we don't remember why 48 was important. 
+
+Remove these samples and remake the metadata heatmap. 
+
+```{r}
+md_cleanest <- filter(md_cleaner, !Timepoint %in% c("T2", "T6", "T7", "T9", "T10", "T14", "T16", "T42", "T48"))
+```
+
+```{r}
+#make matrix of values to plot:
+four <- data.frame("Donor_ID" = md_cleanest$Donor_ID, "Timepoint" = md_cleanest$Timepoint, 
+                   "Infection" = md_cleanest$`Infection(TB/NI)`, "Batch" = md_cleanest$Run)
+
+#count number of samples, regardless of run
+three <- count(four, Donor_ID, Timepoint, Infection)
+
+#adjust factor levels so timepoints and Infection are in order (donors are pretty good already):
+four$Timepoint <- factor(four$Timepoint, levels = rev(c("T0","T1","T3", "T4", "T5","T8","T12","T18","T24","T30","T36")))
+
+four$Infection <- factor(four$Infection, levels = c("NI", "Mtb"))
+
+four$Batch <- factor(four$Batch, levels = c("run1", "run2", "run3", "run4"))
+
+# Convert n to a factor
+three$n <- factor(three$n)
+
+four
+three
+```
+```{r}
+p <- ggplot() +
+  geom_tile(data = four, aes(x=Donor_ID, y=Timepoint, fill = Batch), color = "white", size=0.2) +
+  geom_text(data = three, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(family = "Calibri", colour = "black")) +
+  ggsci::scale_fill_nejm(alpha = 0.5)
+p
+```
+Also drop run4 for Mtb - AF781 - T8 and Mtb - AF53 - T3 and NI - AF278 - T24. Also remove mtb T4. 
+
+```{r}
+md_cleanest <- filter(md_cleanest, !Timepoint == "T8" | 
+           !`Infection(TB/NI)` == "Mtb" |
+           !Donor_ID == "AF781" |
+           !Run == "run4") %>%
+  filter(!Timepoint == "T3" | 
+           !`Infection(TB/NI)` == "Mtb" |
+           !Donor_ID == "AF53" |
+           !Run == "run4") %>%
+  filter(!Timepoint == "T24" | 
+           !`Infection(TB/NI)` == "NI" |
+           !Donor_ID == "AF278" |
+           !Run == "run4") %>%
+  filter(!Timepoint == "T4" | 
+           !`Infection(TB/NI)` == "Mtb")
+```
+
+```{r}
+#make matrix of values to plot:
+four <- data.frame("Donor_ID" = md_cleanest$Donor_ID, "Timepoint" = md_cleanest$Timepoint, 
+                   "Infection" = md_cleanest$`Infection(TB/NI)`, "Batch" = md_cleanest$Run)
+
+#count number of samples, regardless of run
+three <- count(four, Donor_ID, Timepoint, Infection)
+
+#adjust factor levels so timepoints and Infection are in order (donors are pretty good already):
+four$Timepoint <- factor(four$Timepoint, levels = rev(c("T0","T1","T3", "T4", "T5","T8","T12","T18","T24","T30","T36")))
+
+four$Infection <- factor(four$Infection, levels = c("NI", "Mtb"))
+
+four$Batch <- factor(four$Batch, levels = c("run1", "run2", "run3", "run4"))
+
+# Convert n to a factor
+three$n <- factor(three$n)
+
+four
+three
+```
+```{r}
+p <- ggplot() +
+  geom_tile(data = four, aes(x=Donor_ID, y=Timepoint, fill = Batch), color = "white", size=0.2) +
+  geom_text(data = three, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(family = "Calibri", colour = "black")) +
+  ggsci::scale_fill_aaas(alpha = 0.5)
+p
+```
+
+### Reassign NI
+
+So NI has different timepoint annotations for the initial timepoints between run1 and run2. In theory they are the same, so we want to reassign T0 to T1 and T4 to both T5 and T3.  
+
+```{r}
+#T0 -> T1
+md_cleanest <- mutate(md_cleanest, Timepoint = if_else(`Infection(TB/NI)` == "NI" & Run == "run1" & Timepoint == "T0", "T1", Timepoint))
+
+#T4 -> T5
+md_cleanest <- mutate(md_cleanest, Timepoint = if_else(`Infection(TB/NI)` == "NI" & Run == "run1" & Timepoint == "T4", "T5", Timepoint))
+
+#duplicate T5 and reassign to T3. Also need to adjust the filename. 
+md_cleanest <- md_cleanest %>% 
+  bind_rows(
+    filter(., `Infection(TB/NI)` == "NI" & Run == "run1" & Timepoint == "T5") %>%
+      mutate(Timepoint = "T3") %>% mutate(filename=paste0(filename, "_duplicated"))
+  )
+```
+
+Okay I think this worked. Now plot. 
+
+```{r}
+#make matrix of values to plot:
+four <- data.frame("Donor_ID" = md_cleanest$Donor_ID, "Timepoint" = md_cleanest$Timepoint, 
+                   "Infection" = md_cleanest$`Infection(TB/NI)`, "Batch" = md_cleanest$Run)
+
+#count number of samples, regardless of run
+three <- count(four, Donor_ID, Timepoint, Infection)
+
+#adjust factor levels so timepoints and Infection are in order (donors are pretty good already):
+four$Timepoint <- factor(four$Timepoint, levels = rev(c("T0","T1","T3", "T4", "T5","T8","T12","T18","T24","T30","T36")))
+
+four$Infection <- factor(four$Infection, levels = c("NI", "Mtb"))
+
+four$Batch <- factor(four$Batch, levels = c("run1", "run2", "run3", "run4"))
+
+# Convert n to a factor
+three$n <- factor(three$n)
+
+four
+three
+
+p <- ggplot() +
+  geom_tile(data = four, aes(x=Donor_ID, y=Timepoint, fill = Batch), color = "white", size=0.2) +
+  geom_text(data = three, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(family = "Calibri", colour = "black")) +
+  ggsci::scale_fill_aaas(alpha = 0.5)
+p
+```
+Sweet this worked. We are still missing AF95 T18 and EU144 T1 and EU262 T36 in the non-infection. Just use the nearest Timepoint and duplicate. This is okay, especially since it is non-infected. 
+
+Grab T12 for AF95 T18, T3 for EU144 T1, and T30 for EU262 T36. 
+
+```{r}
+#T12 for AF95 T18
+md_cleanest <- md_cleanest %>% 
+  bind_rows(
+    filter(., `Infection(TB/NI)` == "NI" & Donor_ID == "AF95" & Timepoint == "T12") %>%
+      mutate(Timepoint = "T18") %>% mutate(filename=paste0(filename, "_duplicated"))
+  )
+
+#T3 for EU144 T1
+md_cleanest <- md_cleanest %>% 
+  bind_rows(
+    filter(., `Infection(TB/NI)` == "NI" & Donor_ID == "EU144" & Timepoint == "T3") %>%
+      mutate(Timepoint = "T1") %>% mutate(filename=paste0(filename, "_duplicated"))
+  )
+
+#T30 for EU262 T36
+md_cleanest <- md_cleanest %>% 
+  bind_rows(
+    filter(., `Infection(TB/NI)` == "NI" & Donor_ID == "EU262" & Timepoint == "T30") %>%
+      mutate(Timepoint = "T36") %>% mutate(filename=paste0(filename, "_duplicated"))
+  )
+```
+
+Now plot. 
+
+```{r}
+#make matrix of values to plot:
+four <- data.frame("Donor_ID" = md_cleanest$Donor_ID, "Timepoint" = md_cleanest$Timepoint, 
+                   "Infection" = md_cleanest$`Infection(TB/NI)`, "Batch" = md_cleanest$Run)
+
+#count number of samples, regardless of run
+three <- count(four, Donor_ID, Timepoint, Infection)
+
+#adjust factor levels so timepoints and Infection are in order (donors are pretty good already):
+four$Timepoint <- factor(four$Timepoint, levels = rev(c("T0","T1","T3", "T4", "T5","T8","T12","T18","T24","T30","T36")))
+
+four$Infection <- factor(four$Infection, levels = c("NI", "Mtb"))
+
+four$Batch <- factor(four$Batch, levels = c("run1", "run2", "run3", "run4"))
+
+# Convert n to a factor
+three$n <- factor(three$n)
+
+four
+three
+
+p <- ggplot() +
+  geom_tile(data = four, aes(x=Donor_ID, y=Timepoint, fill = Batch), color = "white", size=0.2) +
+  geom_text(data = three, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(family = "Calibri", colour = "black")) +
+  ggsci::scale_fill_aaas(alpha = 0.5)
+p
+```
+
+```{r}
+#write metadata and save pdf
+write_tsv(file = "results/metadata_filtered-samples.tsv", x = md_cleanest, col_names = T)
+ggsave(plot = p, filename = "results/metadata_filtered-samples_heatmap.pdf", device = cairo_pdf)
+```

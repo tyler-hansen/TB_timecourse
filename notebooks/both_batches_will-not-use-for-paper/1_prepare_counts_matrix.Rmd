@@ -1,0 +1,57 @@
+---
+title: "Convert kallisto transript level to gene level and join samples"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 11.19.2023 | update 3.15.24
+
+We have transcript level data in kallisto files. We need and want to work with TPM at the gene level. This notebook describes converting transcript level to gene level for all relevant files. In addition, in the tximport call, we join all samples and output the converted counts as a dataframe. 
+
+```{r, Libraries, echo=FALSE}
+library(tidyverse)
+library(GenomicFeatures)
+library(tximport)
+library(rhdf5)
+```
+
+```{r, Assign Files}
+# GTF
+GTF <- 'data/Homo_sapiens.GRCh38.87.gtf'
+
+#sample info
+CN <- c("kallisto_number", "Donor_ID", "Timepoint", "Infection(TB/NI)", "MOI", "Location", "Run", "filename", "sample_ID") #column names
+sample_info <- read_tsv("results/metadata.tsv", col_names = CN)
+
+#kallisto files. This uses the filename and sample_ID key-value pair to match the metadata to the counts
+files <- file.path("data/kallisto_TB-relevant", sample_info$filename, "abundance.h5")
+names(files) <- sample_info$filename
+```
+
+
+```{r, make ts2gene object}
+txdb <- makeTxDbFromGFF(GTF,format='gtf')
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+```
+
+```{r, Import Kallisto h5 files}
+# Gene-level lengthScaledTPM
+txi.kallisto.gene_level.lengthScaledTPM <- tximport(files, type = "kallisto", txOut = FALSE, 
+                                                    tx2gene=tx2gene, countsFromAbundance= 'lengthScaledTPM')
+```
+
+```{r, Convert to df}
+df <- as.tibble(txi.kallisto.gene_level.lengthScaledTPM$counts)
+df$gene_id <- row.names(txi.kallisto.gene_level.lengthScaledTPM$counts)  
+df <- relocate(df, gene_id, .before = kallisto_4_AF278_T24_NI_MONTREAL_run2)
+```
+
+```{r, Write}
+# as rds
+saveRDS(txi.kallisto.gene_level.lengthScaledTPM$counts, file = "data/kallisto.gene-level.lengthScaledTPM.rds")
+
+#as tsv
+write_tsv(df, file = "data/kallisto.gene-level.lengthScaledTPM.tsv", col_names = TRUE)
+```

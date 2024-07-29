@@ -1,0 +1,1206 @@
+---
+title: "Explore Modeling of Batch1 Only"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 4.16.2024
+
+In the previous notebook, we noticed the batch2 data was not usable because it was confounded by the presence of an immune response in the NI samples. We decided to only use the first batch, so I will analyze that further in this notebook. 
+
+This is a little more complicated than just filtering for batch1. We need to revisit the entire batch1 data set because now we might to use some more samples from that one. Therefore load the sample info and cts from the beginning of notebook 4 (sample adjustment). 
+
+## Setup 
+
+Packages
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(limma)
+library(edgeR)
+```
+
+Three tables
+```{r}
+#read in GTF
+gtf <- rtracklayer::readGFFAsGRanges("data/Homo_sapiens.GRCh38.87.gtf")
+
+#read in cts
+cts <- readRDS("data/filtered_counts_QCd_samples.rds")
+
+#read in si
+sample_info <- readRDS("data/metadata_with-covariates_QCd_samples.rds")
+```
+
+
+## Adjust samples
+Before analyzing them, we need to adjust the sample data so that it makes sense. Use the heatmaps from notebook 4 to do this
+
+### Remove batch2 and drop unnecessary covariates.
+
+Also drop timepoint_hr because it will be changed when duplicated. 
+```{r}
+sample_info_adjusted <- dplyr::filter(sample_info, Run == "run1")
+sample_info_adjusted <- dplyr::select(sample_info_adjusted, -db, -Sex, -Age, -Run, -Location, -Timepoint_hr)
+```
+
+### Make a heatmap of batch1 samples
+Facet by infection, x = donor_id, y = timepoint, value = number of samples
+
+```{r}
+#make matrix of values to plot:
+si_subset <- dplyr::select(sample_info_adjusted, Donor_ID, Timepoint, Infection)
+
+#reverse order of timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+
+#count number of samples, regardless of run
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+
+# Convert n to a factor
+si_subset_count$n <- factor(si_subset_count$n)
+
+heatmap_all_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black"), legend.position = "none") +
+  ggsci::scale_fill_npg(alpha = 0.5)
+heatmap_all_samples
+```
+
+### Remove AF145:
+```{r}
+sample_info_adjusted <- dplyr::filter(sample_info_adjusted, Donor_ID != "AF145")
+
+#make matrix of values to plot:
+si_subset <- dplyr::select(sample_info_adjusted, Donor_ID, Timepoint, Infection)
+
+#reverse order of timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+
+#count number of samples, regardless of run
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+
+# Convert n to a factor
+si_subset_count$n <- factor(si_subset_count$n)
+
+ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black"), legend.position = "none") +
+  ggsci::scale_fill_npg(alpha = 0.5)
+```
+
+### Filter cts
+```{r}
+cts_adjusted <- cts[, row.names(sample_info_adjusted )]
+```
+
+
+### Approach 1:
+Keep all timepoints and fill in missing data. 
+
+Step 1 - Duplicate NI to nearest Mtb timepoint:
+  T0 --> T1/T2
+  T4 --> T3/T5/T6
+  T8 --> T7/T9
+  T12 --> T10/T14
+  T18 --> T16
+  T48 --> T42
+
+Function for duplicating timepoints
+```{r}
+duplicate_timepoints <- function(si, reference_t, assigned_t, counts) {
+  #extract the desired timepoint
+  tmp <- dplyr::filter(si, Infection == "NI" & Timepoint == reference_t)
+  
+  #change to new timepoint
+  tmp <- mutate(tmp, Timepoint = assigned_t)
+  
+  #change rownames so there are no dupliicates
+  rnames <- rownames(tmp)
+  rownames(tmp) <- paste0("duplicated_", rnames)
+  
+  #add back to si
+  si <- bind_rows(si, tmp)
+  
+  #now adjust counts with for loop over rnames. Duplicate sample with rname and add duplicated to it. 
+  counts <- as.data.frame(counts)
+  for (sample in rnames) {
+    dup_sample <- paste0("duplicated_", sample)
+    counts[,dup_sample] <- counts[, sample]
+    rm(dup_sample)
+  }
+  
+  #this should work, but stop if si and counts are not equivalent. If 
+  if (all(colnames(counts) == rownames(si))) {
+    res <- list(counts, si)
+    return(res)
+  }
+  else {
+    stop("Sample info and counts are not equivalent after operation")
+  }
+}
+```
+
+T0 --> T1
+```{r}
+adjusted <- duplicate_timepoints(si = sample_info_adjusted, reference_t = "T0", assigned_t = "T1", counts = cts_adjusted)
+```
+
+T0 --> T1 --> T2
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T1", assigned_t = "T2", counts = adjusted[[1]])
+```
+
+T4 --> T3
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T4", assigned_t = "T3", counts = adjusted[[1]])
+```
+
+T4 --> T3 --> T5
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T3", assigned_t = "T5", counts = adjusted[[1]])
+```
+
+T4 --> T3 --> T5 --> T6
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T5", assigned_t = "T6", counts = adjusted[[1]])
+```
+
+T8 --> T7
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T8", assigned_t = "T7", counts = adjusted[[1]])
+```
+
+T8 --> T7 --> T9
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T7", assigned_t = "T9", counts = adjusted[[1]])
+```
+
+T12 --> T10
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T12", assigned_t = "T10", counts = adjusted[[1]])
+```
+
+T12 --> T10 --> T14
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T10", assigned_t = "T14", counts = adjusted[[1]])
+```
+
+T18 --> T16
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T18", assigned_t = "T16", counts = adjusted[[1]])
+```
+
+T48 --> T42
+```{r}
+adjusted <- duplicate_timepoints(si = adjusted[[2]], reference_t = "T48", assigned_t = "T42", counts = adjusted[[1]])
+```
+
+Extract cts and si. Plot new heatmap. 
+```{r}
+cts_adjusted <- adjusted[[1]]
+sample_info_adjusted <- adjusted[[2]]
+
+#prepare for heatmap
+si_subset <- dplyr::select(sample_info_adjusted, Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+#heatmap
+ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black"), legend.position = "none") +
+  ggsci::scale_fill_npg(alpha = 0.5)
+```
+
+Sweet this worked. Now fill in the missing data. 
+
+Step 2: for missing timepoints, duplicate nearest with condition and donor. 
+
+AF95/NI: T14 --> T16
+AF95/NI: T14 --> T16 --> T18
+EU144/NI: T6 --> T2 #we want T6 because this was the last point that was duplicated and using T3 would have duplicate rownames
+EU144/NI: T6 --> T2 --> T1
+EU144/NI: T6 --> T2 --> T1 --> T0
+AF193/Mtb: T12 --> T14
+EU144/Mtb: T16 --> T18
+
+```{r}
+duplicate_timepoints_2 <- function(si, reference_t, assigned_t, counts, condition, donor) {
+  #extract the desired timepoint
+  tmp <- dplyr::filter(si, Infection == condition & Timepoint == reference_t & Donor_ID == donor)
+  
+  #change to new timepoint
+  tmp <- mutate(tmp, Timepoint = assigned_t)
+  
+  #change rownames so there are no dupliicates
+  rnames <- rownames(tmp)
+  rownames(tmp) <- paste0("duplicated_", rnames)
+  
+  #add back to si
+  si <- bind_rows(si, tmp)
+  
+  #now adjust counts with for loop over rnames. Duplicate sample with rname and add duplicated to it. 
+  counts <- as.data.frame(counts)
+  for (sample in rnames) {
+    dup_sample <- paste0("duplicated_", sample)
+    counts[,dup_sample] <- counts[, sample]
+    rm(dup_sample)
+  }
+  #this should work, but stop if si and counts are not equivalent. If 
+  if (all(colnames(counts) == rownames(si))) {
+    res <- list(counts, si)
+    return(res)
+  }
+  else {
+    stop("Sample info and counts are not equivalent after operation")
+  }
+}
+```
+
+```{r}
+#AF95/NI: T14 --> T16
+adjusted_2 <- duplicate_timepoints_2(si = sample_info_adjusted, counts = cts_adjusted, reference_t = "T14", assigned_t = "T16", condition = "NI", donor = "AF95")
+
+#AF95/NI: T14 --> T16 --> T18
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T16", assigned_t = "T18", condition = "NI", donor = "AF95")
+
+#EU144/NI: T6 --> T2
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T6", assigned_t = "T2", condition = "NI", donor = "EU144")
+
+#EU144/NI: T6 --> T2 --> T1
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T2", assigned_t = "T1", condition = "NI", donor = "EU144")
+
+#EU144/NI: T6 --> T2 --> T1 --> T0
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T1", assigned_t = "T0", condition = "NI", donor = "EU144")
+
+#AF193/Mtb: T12 --> T14
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T12", assigned_t = "T14", condition = "Mtb", donor = "AF193")
+
+#EU144/Mtb: T16 --> T18
+adjusted_2 <- duplicate_timepoints_2(si = adjusted_2[[2]], counts = adjusted_2[[1]], reference_t = "T16", assigned_t = "T18", condition = "Mtb", donor = "EU144")
+```
+
+Extract cts and si. Plot new heatmap. 
+```{r}
+cts_adjusted <- adjusted_2[[1]]
+sample_info_adjusted <- adjusted_2[[2]]
+
+#prepare for heatmap
+si_subset <- dplyr::select(sample_info_adjusted, Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+#heatmap
+ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black"), legend.position = "none") +
+  ggsci::scale_fill_npg(alpha = 0.5)
+```
+
+This is great, but we will not need T0 and it could be confounding, so remove that timepoint. 
+```{r}
+sample_info_adjusted <- dplyr::filter(sample_info_adjusted, Timepoint != "T0")
+cts_adjusted <- cts_adjusted[, row.names(sample_info_adjusted)]
+
+#prepare for heatmap
+si_subset <- dplyr::select(sample_info_adjusted, Donor_ID, Timepoint, Infection)
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+si_subset_count$n <- factor(si_subset_count$n)
+
+#heatmap
+ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Infection), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black"), legend.position = "none") +
+  ggsci::scale_fill_npg(alpha = 0.5)
+```
+
+Beautiful. Now we have the format for approach 1. For approach 2 just remove the timepoints that were duplicated in step 1:
+```{r}
+#before, adjust factors to remove levels from batch2
+sample_info_adjusted$flow_cell <- factor(as.character(sample_info_adjusted$flow_cell))
+sample_info_adjusted$Donor_ID <- factor(as.character(sample_info_adjusted$Donor_ID))
+sample_info_adjusted$Timepoint <- factor(sample_info_adjusted$Timepoint, levels = rev(c("T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")))
+
+#add timepoint_hr column back
+sample_info_adjusted <- mutate(sample_info_adjusted, Timepoint_hr = as.numeric(str_remove(Timepoint, "T"))) %>%
+  relocate(Timepoint_hr, .after = Timepoint)
+
+sample_info_adjusted_approach2 <- dplyr::filter(sample_info_adjusted, Timepoint %in% c("T4","T8","T12","T18","T24","T30","T36","T48"))
+cts_adjusted_approach2 <- cts_adjusted[, row.names(sample_info_adjusted_approach2)]
+```
+
+Save cts and si:
+```{r}
+#approach1
+saveRDS(sample_info_adjusted, file = "data/metadata_batch1-only_approach1_all-samples.rds")
+saveRDS(cts_adjusted, file = "data/cts_batch1-only_approach1_all-samples.rds")
+
+#approach2
+saveRDS(sample_info_adjusted_approach2, file = "data/metadata_batch1-only_approach2_subset-samples.rds")
+saveRDS(cts_adjusted_approach2, file = "data/cts_batch1-only_approach2_subset-samples.rds")
+```
+
+## Explore all batch1 data (approach 1)
+
+Update three tables overwriting sample_info and cts objects
+```{r}
+#read in SI
+sample_info <- readRDS("data/metadata_batch1-only_approach1_all-samples.rds")
+
+#read in cts
+cts <- readRDS("data/cts_batch1-only_approach1_all-samples.rds")
+```
+
+
+### Check varaible balance
+
+Determine if confounding categorical variables are balanced across experimental using tables. 
+
+Check ancestry
+```{r}
+table(sample_info$self_reported_ethnicity, sample_info$flow_cell)
+```
+
+They are generally well-balanced. 
+
+Check timepoint
+```{r}
+table(sample_info$Timepoint, sample_info$flow_cell)
+```
+
+Flow cell by timepoint isn't balanced at all, but this should be fine as my analysis will be by timepoint not across timepoints. 
+
+Check Infection
+```{r}
+table(sample_info$Infection, sample_info$flow_cell)
+```
+
+Data is well balanced across conditions.
+
+Check distribution of continuous covariates across important categorical variables
+
+perc_Dups
+```{r}
+ggplot(sample_info, aes(x = perc_Dups, color = self_reported_ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Dups, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Dups, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+The balance is okay. 
+
+perc_Aligned
+```{r}
+ggplot(sample_info, aes(x = perc_Aligned, color = self_reported_ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Aligned, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_Aligned, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+They are okay. Infection is pretty bad. Maybe not do perc_Aligned unless it is necessary based on perc variance.  
+
+perc_GC
+```{r}
+ggplot(sample_info, aes(x = perc_GC, color = self_reported_ethnicity)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_GC, color = Timepoint)) +
+  geom_density() +
+  theme_bw()
+
+ggplot(sample_info, aes(x = perc_GC, color = Infection)) +
+  geom_density() +
+  theme_bw()
+```
+
+Infection is not super well balanced, if the variance is not high, maybe best to not include. For ethnicity is is really good. 
+
+## Check confounding variables (and others) using PCA plots
+
+Voom transform
+```{r}
+dge <- DGEList(cts)
+dge <- calcNormFactors(dge)
+design_base <- model.matrix(~1, sample_info)
+v <- voom(dge, design_base, plot = T)
+```
+
+Calculate PCs
+```{r}
+mat <- as.matrix(v$E) %>% t()
+pcamat <- prcomp(mat)
+```
+
+Plot variance explained by top 20 PCAs
+```{r}
+#variance explained by PCs
+pc_eigenvalues <- pcamat$sdev^2
+pc_eigenvalues <- tibble(PC = factor(1:length(pc_eigenvalues)), variance = pc_eigenvalues) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+
+ggplot(pc_eigenvalues , aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + coord_cartesian(xlim = c(0,20))
+```
+
+PC1 and PC2 explains a lot, but it looks like PCs1-5 contribute a notable amount as well.  
+
+Plot PC1 and PC2 and use color/point type for variables
+```{r, fig.dim=c(9,5)}
+#Prepare df for plotting, just select the first 20 PCs
+pc_scores <- as.data.frame(pcamat$x)[, 1:20] %>% rownames_to_column(var = "filename")
+
+#add metadata
+pc_scores <- rownames_to_column(sample_info, var = "filename") %>% left_join(x = pc_scores, by = "filename")
+
+#relevel infection:
+pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+```
+
+Plot PC1 vs. PC2 and annotate with infection and other variables
+```{r, fig.height=6, fig.width=7}
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_ancestry <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_ancestry
+p_flow
+```
+
+There is a timepoint effect within PC1, but the main effect is NI and Mtb condition. Looks like there may be some ancestry effects as well. 
+
+Let's now do a formal analysis to identify which covariates to include:
+
+## Identify Relevant Technical Confounders
+
+Following the procedure used in Nedelec et al. Cell 2016, identify technical confounders in the filtered dataset. 
+
+1. Let model_ref denote the reference model with no covariates where only an intercept is estimated for the gene expression data. In addition, model_x is the model with reference model with only one additional covariate "x" and do this for all possible covariates. Estimate the variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models. 
+
+2. For each technical confounder, conduct the following procedure for 200 iterations per gene:
+  a) Permute the entries of the original confounder "x"
+  b) Set up a model_random which is the reference model with the permuted covariate "x"
+  c) Calculate the random variance in expression data explained (v_random) by (SS_ref-SS_random)/SS_ref
+
+3. For each confounder, compare the distribution of v_x of all genes to the distributions of randomized values (v_random) with a Mann-Whitney U test. The shift between the two ditributions at a significance level of p = 0.05 is denoted by delta_x. 
+
+4. Compare the delta_x values for all confounders and chose the technical confounder with the maximum shift, if delta > 0.01, so add to the reference model. 
+
+5. Repeat Steps 1-3 using the updated reference model. After re-evaluating the delta_x values:
+  a) Among the set of confounders present in model_ref, remove the one with the lowest delta value from model_ref, if the shift was below 0.01. 
+  b) Among the set of confounders absent from model_ref, add the one which satisfied the selection procedure described in step 4 to the reference model. 
+
+6. Repeat step 5 until a refernce model is obtained where only the covariats in the model satified the condition in step 4 (i.e., their contribution in explaining the variability in the data is least 1% more than that of an arbitrary random variable). 
+
+### Step 1
+Technical Confounders to Measure:
+1. flow_cell
+2. perc_dups
+3. perc_GC
+4. perc_aligned
+
+Set-up Models
+```{r}
+model_ref <- model.matrix(~1, data = sample_info)
+model_fc <- model.matrix(~flow_cell, data = sample_info)
+model_dups <- model.matrix(~perc_Dups, data = sample_info)
+model_gc <- model.matrix(~perc_GC, data = sample_info)
+model_aligned <- model.matrix(~perc_Aligned, data = sample_info)
+```
+
+Fit data to each model
+```{r}
+#fit model - eBayes is not needed for extracting residuals and the values of vfit and efit are identical when extracting residuals
+vfit_ref <- lmFit(v, model_ref)
+vfit_fc <-lmFit(v, model_fc)
+vfit_dups <-lmFit(v, model_dups)
+vfit_gc <-lmFit(v, model_gc)
+vfit_aligned <-lmFit(v, model_aligned)
+```
+
+Calculate residual sum of squares for each gene
+```{r}
+rss_ref <- rowSums(residuals(vfit_ref, v$E)^2)
+rss_fc <- rowSums(residuals(vfit_fc, v$E)^2)
+rss_dups <- rowSums(residuals(vfit_dups, v$E)^2)
+rss_gc <- rowSums(residuals(vfit_gc, v$E)^2)
+rss_aligned <- rowSums(residuals(vfit_aligned, v$E)^2)
+```
+
+Estimate the variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+```{r}
+all(rownames(rss_ref) == rownames(rss_fc))
+all(rownames(rss_ref) == rownames(rss_dups))
+all(rownames(rss_ref) == rownames(rss_gc))
+all(rownames(rss_ref) == rownames(rss_aligned))
+
+v_fc <- (rss_ref - rss_fc)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+v_gc <- (rss_ref - rss_gc)/rss_ref
+v_aligned <- (rss_ref - rss_aligned)/rss_ref
+```
+
+
+### Step 2
+
+For 10 interations, permute using permutations() function from rsample package, model perumted data, calculate RSS variance for that model for each gene, then append to a vector. 
+
+I wrote this as a function to operate, it returns a vector of the RSS variance for each gene 
+```{r}
+library(rsample)
+library(rlist)
+
+#function to run on each confounder
+permute_si_vars <- function(confounder, sample_info = sample_info, n) {
+  #permute the variable of interest
+  x <- permutations(sample_info, permute = all_of(confounder), times = n)
+  
+  # create dummy list
+  list_x <- list()
+  
+  #extract each iteration and set_up random models:
+  for (i in seq(1, n)) {
+    #extract permuted ith iteration
+    si_rand <- x$splits[[i]] %>% analysis() %>% as.data.frame()
+    
+    #add to list
+    list_x <- list.append(list_x, si_rand)
+  }
+
+  #return list
+  return(list_x)
+}
+
+estimate_random_variance <- function(perms, formula, voom_cts, n, rss_ref) {
+  # set up dummy vector
+  vec <- c()
+  #extract each iteration and set_up random models:
+    for (i in seq(1, n)) {
+      #set up model for ith iteration
+      m_rand <- model.matrix(as.formula(formula), data = as.data.frame(perms[i]))
+    
+      #fit model for each iteration
+      vfit_rand <- lmFit(voom_cts, m_rand)
+    
+      #Calculate the resisual sum of squares for each iteration for each gene
+      rss_rand <- rowSums(residuals(vfit_rand, voom_cts$E)^2)
+      
+      if (all(rownames(rss_ref) == rownames(rss_rand))) {
+      #Estimate the variance in expression data explained
+      v <- (rss_ref - rss_rand)/rss_ref
+      } else {
+        stop("random rownames do not match reference rownames")
+      }
+      vec <- append(vec, v)
+    }
+  return(vec)
+}
+```
+
+Permute variables
+```{r}
+fc_perms <- permute_si_vars("flow_cell", sample_info, n = 10)
+dups_perms <- permute_si_vars("perc_Dups", sample_info, n = 10)
+gc_perms <- permute_si_vars("perc_GC", sample_info, n = 10)
+aligned_perms <- permute_si_vars("perc_Aligned", sample_info, n = 10)
+```
+
+estimate random variance of variable with model_x models
+```{r}
+v_fc_rand <- estimate_random_variance(fc_perms, "~ flow_cell", voom_cts = v, n = 10, rss_ref = rss_ref)
+v_dups_rand <- estimate_random_variance(dups_perms, "~ perc_Dups", voom_cts = v, n = 10, rss_ref = rss_ref)
+v_gc_rand <- estimate_random_variance(gc_perms, "~ perc_GC", voom_cts = v, n = 10, rss_ref = rss_ref)
+v_aligned_rand <- estimate_random_variance(aligned_perms, "~ perc_Aligned", voom_cts = v, n = 10, rss_ref = rss_ref)
+```
+
+### Step 3
+
+```{r}
+get_delta <- function(x, y) {
+  
+  #calculate pval for mann-whitney
+  MU_test <- wilcox.test(x = x, y = y)
+  
+  #if pval < 0.05, calculate delta by subtracting means and applying absolute value. 
+  if (MU_test$p.val < 0.05) {
+    delta <- abs(mean(x) - mean(y))
+    #return delta
+    return(delta)
+  } else {
+    print("not significant")
+  }
+}
+```
+
+Execute functions and output deltas
+```{r}
+get_delta(x = v_fc, y = v_fc_rand)
+get_delta(x = v_dups, y = v_dups_rand)
+get_delta(x = v_gc, y = v_gc_rand)
+get_delta(x = v_aligned, y = v_aligned_rand)
+```
+
+### Step 4
+Compare the delta_x values for all confounders and chose the technical confounder with the maximum shift, if delta > 0.01, so add to the reference model. 
+
+This is obvious based on values above, but plot to show the distributions. 
+```{r}
+#convert real values to dfs and label.
+df_fc <- v_fc %>% as.data.frame()
+colnames(df_fc) <- "Flow Cell"
+
+df_dups <- v_dups %>% as.data.frame()
+colnames(df_dups) <- "% Duplicated"
+
+df_gc <- v_gc %>% as.data.frame()
+colnames(df_gc) <- "% GC"
+
+df_aligned <- v_aligned %>% as.data.frame()
+colnames(df_aligned) <- "% Aligned"
+
+#bind cols
+df_real <- bind_cols(df_fc, df_dups, df_gc, df_aligned) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_fc_rand <- v_fc_rand %>% as.data.frame()
+colnames(df_fc_rand) <- "Flow Cell"
+
+df_dups_rand <- v_dups_rand %>% as.data.frame()
+colnames(df_dups_rand) <- "% Duplicated"
+
+df_gc_rand <- v_gc_rand %>% as.data.frame()
+colnames(df_gc_rand) <- "% GC"
+
+df_aligned_rand <- v_aligned_rand %>% as.data.frame()
+colnames(df_aligned_rand) <- "% Aligned"
+
+#bind cols
+df_random <- bind_cols(df_fc_rand, df_dups_rand, df_gc_rand, df_aligned_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("Batch", "% Aligned", "% GC", "% Duplicated", "Flow Cell")))
+```
+
+```{r}
+p <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "slateblue")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p
+```
+
+
+Perc aligned has the largest delta. Add to reference model. 
+
+### Step 5
+Repeat Steps 1-3 using the updated reference model. After re-evaluating the delta_x values:
+  a) Among the set of confounders present in model_ref, remove the one with the lowest delta value from model_ref, if the shift was below 0.01. 
+  b) Among the set of confounders absent from model_ref, add the one which satisfied the selection procedure described in step 4 to the reference model. 
+
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ perc_Aligned, data = sample_info)
+
+#set up new models
+model_fc <- model.matrix(~ perc_Aligned + flow_cell, data = sample_info)
+model_dups <- model.matrix(~ perc_Aligned + perc_Dups, data = sample_info)
+model_gc <- model.matrix(~ perc_Aligned + perc_GC, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v, model_ref)
+vfit_fc <- lmFit(v, model_fc)
+vfit_dups <-lmFit(v, model_dups)
+vfit_gc <-lmFit(v, model_gc)
+```
+
+```{r}
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v$E)^2)
+rss_fc <- rowSums(residuals(vfit_fc, v$E)^2)
+rss_dups <- rowSums(residuals(vfit_dups, v$E)^2)
+rss_gc <- rowSums(residuals(vfit_gc, v$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_fc <- (rss_ref - rss_fc)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+v_gc <- (rss_ref - rss_gc)/rss_ref
+
+#generate random variance
+v_fc_rand <- estimate_random_variance(fc_perms, "~ perc_Aligned + flow_cell", voom_cts = v, n = 10, rss_ref = rss_ref)
+v_dups_rand <- estimate_random_variance(dups_perms, "~ perc_Aligned + perc_Dups", voom_cts = v, n = 10, rss_ref = rss_ref)
+v_gc_rand <- estimate_random_variance(gc_perms, "~ perc_Aligned + perc_GC", voom_cts = v, n = 10, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_fc, y = v_fc_rand)
+get_delta(x = v_dups, y = v_dups_rand)
+get_delta(x = v_gc, y = v_gc_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_fc <- v_fc %>% as.data.frame()
+colnames(df_fc) <- "Flow Cell"
+
+df_dups <- v_dups %>% as.data.frame()
+colnames(df_dups) <- "% Duplicated"
+
+df_gc <- v_gc %>% as.data.frame()
+colnames(df_gc) <- "% GC"
+
+#bind cols
+df_real <- bind_cols(df_fc, df_dups, df_gc) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_fc_rand <- v_fc_rand %>% as.data.frame()
+colnames(df_fc_rand) <- "Flow Cell"
+
+df_dups_rand <- v_dups_rand %>% as.data.frame()
+colnames(df_dups_rand) <- "% Duplicated"
+
+df_gc_rand <- v_gc_rand %>% as.data.frame()
+colnames(df_gc_rand) <- "% GC"
+
+#bind cols
+df_random <- bind_cols(df_fc_rand, df_dups_rand, df_gc_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("% GC", "% Duplicated", "Flow Cell")))
+
+#plot
+p_1 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "skyblue")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_1
+```
+
+perc_gc is highest, add to the reference model and move to step 6. 
+
+### Step 6
+Repeat step 5 until a refernce model is obtained where only the covariats in the model satified the condition in step 4. 
+
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ perc_Aligned + perc_GC, data = sample_info)
+
+#set up new models
+model_fc <- model.matrix(~ perc_Aligned + perc_GC+ flow_cell, data = sample_info)
+model_dups <- model.matrix(~ perc_Aligned + perc_GC + perc_Dups, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v, model_ref)
+vfit_fc <- lmFit(v, model_fc)
+vfit_dups <-lmFit(v, model_dups)
+```
+
+```{r}
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v$E)^2)
+rss_fc <- rowSums(residuals(vfit_fc, v$E)^2)
+rss_dups <- rowSums(residuals(vfit_dups, v$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_fc <- (rss_ref - rss_fc)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+
+#generate random variance
+v_fc_rand <- estimate_random_variance(fc_perms, "~ perc_Aligned + perc_GC + flow_cell", voom_cts = v, n = 10, rss_ref = rss_ref)
+v_dups_rand <- estimate_random_variance(dups_perms, "~ perc_Aligned + perc_GC + perc_Dups", voom_cts = v, n = 10, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_fc, y = v_fc_rand)
+get_delta(x = v_dups, y = v_dups_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_fc <- v_fc %>% as.data.frame()
+colnames(df_fc) <- "Flow Cell"
+
+df_dups <- v_dups %>% as.data.frame()
+colnames(df_dups) <- "% Duplicated"
+
+#bind cols
+df_real <- bind_cols(df_fc, df_dups) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_fc_rand <- v_fc_rand %>% as.data.frame()
+colnames(df_fc_rand) <- "Flow Cell"
+
+df_dups_rand <- v_dups_rand %>% as.data.frame()
+colnames(df_dups_rand) <- "% Duplicated"
+
+#bind cols
+df_random <- bind_cols(df_fc_rand, df_dups_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("% Duplicated", "Flow Cell")))
+
+#plot
+p_1 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "springgreen2")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_1
+```
+
+```{r}
+#set up new reference model
+model_ref <- model.matrix(~ perc_Aligned + perc_GC + perc_Dups, data = sample_info)
+
+#set up new models
+model_fc <- model.matrix(~ perc_Aligned + perc_GC + perc_Dups + flow_cell, data = sample_info)
+
+#Fit data to each model
+vfit_ref <- lmFit(v, model_ref)
+vfit_fc <- lmFit(v, model_fc)
+```
+
+```{r}
+#Calculate residual sum of squares for each gene
+rss_ref <- rowSums(residuals(vfit_ref, v$E)^2)
+rss_fc <- rowSums(residuals(vfit_fc, v$E)^2)
+
+#Estimate the new variance in expression data explained (v_x) by the technical covariate by (SS_ref-SS_x)/SS_ref, where SS represent the residual sum of squares in the models.
+v_fc <- (rss_ref - rss_fc)/rss_ref
+v_dups <- (rss_ref - rss_dups)/rss_ref
+
+#generate random variance
+v_fc_rand <- estimate_random_variance(fc_perms, "~ perc_Aligned + perc_GC + perc_Dups + flow_cell", voom_cts = v, n = 10, rss_ref = rss_ref)
+
+#calculate and report new deltas
+get_delta(x = v_fc, y = v_fc_rand)
+```
+
+```{r}
+#convert real values to dfs and label.
+df_fc <- v_fc %>% as.data.frame()
+colnames(df_fc) <- "Flow Cell"
+
+#bind cols
+df_real <- bind_cols(df_fc) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "real")
+
+#convert random values to dfs and label.
+df_fc_rand <- v_fc_rand %>% as.data.frame()
+colnames(df_fc_rand) <- "Flow Cell"
+
+#bind cols
+df_random <- bind_cols(df_fc_rand) %>% 
+  rownames_to_column("gene_id") %>%
+  pivot_longer(cols = 2:last_col(), names_to = "technical confounder", values_to = "variance explained") %>% 
+  mutate(type = "random")
+
+#bind rows
+df <- bind_rows(df_real, df_random)
+
+#adjust levels
+df$`technical confounder` <- factor(df$`technical confounder`, levels = rev(c("Flow Cell")))
+
+#plot
+p_1 <- ggplot(df, aes(x = `variance explained`, y = `technical confounder`, fill = type)) +
+  geom_boxplot(alpha = 1, outlier.alpha = 0) +
+  scale_fill_manual(values = c("grey80", "lightseagreen")) +
+  theme_bw() +
+  coord_cartesian(xlim = c(0,1))
+
+p_1
+```
+
+So the final technical covariate part of the model is: 
+  expr ~ perc_GC + perc_Aligned + perc_Dups + flow_cell
+  
+Now correct expression to remove these effects. 
+
+### Observe PCA of corrected expression for the infection model
+
+Set designs for each model. We want to remove variation due to donor and timepoint so include those and then focus on the Timepoint:Infection nested terms. 
+```{r}
+design_infection <- model.matrix(~ 0 + Timepoint:Infection + Timepoint + Donor_ID + perc_GC + perc_Aligned + perc_Dups + flow_cell, data = sample_info)
+```
+
+Check that design and cts match
+```{r}
+#this should print true
+all(rownames(design_infection) == colnames(cts))
+```
+
+Voom transform - this was done above but repeat again to ensure the object is what we think it is
+```{r}
+v_infection <- DGEList(cts) %>% calcNormFactors() %>% voom(design_infection)
+```
+
+Fit to models
+```{r}
+vfit_infection <- lmFit(v_infection, design_infection) %>% eBayes()
+```
+
+Get corrected expression by adding the relevant coefficients to the residuals. 
+```{r}
+beta_list <- list()
+for (t in c("T1","T2","T3","T4","T5","T6","T7","T8","T9","T10","T12","T14","T16","T18","T24","T30","T36","T42","T48")) {
+  beta <- paste0("Timepoint", t, ":InfectionMtb")
+  beta_list <- append(beta_list, beta)
+}
+
+corrected_infection <- residuals(vfit_infection, v_infection)
+for (beta in beta_list) {
+  corrected_infection <- corrected_infection + vfit_infection$coefficients[,beta]%*%t(design_infection[,beta])
+}
+```
+
+Calculate PCs from corrected expression.
+```{r}
+pc_infection <- as.matrix(corrected_infection) %>% t() %>% prcomp()
+```
+
+Plot variance explained by top 20 PCAs for each
+```{r}
+#infection
+tmp <- pc_infection$sdev^2
+tmp <- tibble(PC = factor(1:length(tmp)), variance = tmp) %>% mutate(pct = variance/sum(variance)*100) %>% mutate(pct_cum = cumsum(pct))
+ggplot(tmp, aes(x = PC)) +
+  geom_col(aes(y = pct)) +
+  geom_line(aes(y = pct_cum, group = 1)) + 
+  geom_point(aes(y = pct_cum)) +
+  labs(x = "Principal component", y = "Fraction variance explained") + 
+  theme_bw() +
+  coord_cartesian(xlim = c(0,20))
+rm(tmp)
+```
+
+Prepare PCs for plotting
+```{r}
+prep_df_for_PCA <- function(pc, si) {
+  #Prepare df for plotting, just select the first 20 PCs
+  pc_scores <- as.data.frame(pc$x)[, 1:20] %>% rownames_to_column(var = "filename")
+
+  #add metadata
+  pc_scores <- rownames_to_column(si, var = "filename") %>% left_join(x = pc_scores, by = "filename")
+
+  #relevel infection:
+  pc_scores$Infection <- factor(pc_scores$Infection, levels = rev(c("NI", "Mtb")))
+  return(pc_scores)
+}
+```
+
+```{r}
+pc_infection_scores <- prep_df_for_PCA(pc_infection, sample_info)
+```
+
+Plot PC1/PC2 for corrected expression infection:
+```{r, fig.height=6, fig.width=7}
+pc_scores <- pc_infection_scores 
+
+p_time <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket", trans = "log10") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_donor <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_flow <- pc_scores %>% 
+  ggplot(aes(x = PC1, y = PC2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+p_time
+p_donor
+p_flow
+
+rm(pc_scores)
+```
+
+Nice! There is a time effect that is captured here. 
+
+Let's look at UMAPs. 
+
+```{r, fig.height=6, fig.width=7}
+umap_scores_from_PCs <- function(pc_mat, si) {
+  
+umap <- umap(pc_mat$x[, 1:20])
+
+#make dfs for plotting
+umap_scores <- as.data.frame(umap$layout) %>% rownames_to_column(var = "filename")
+
+#add metadata
+umap_scores <- rownames_to_column(si, var = "filename") %>% left_join(x = umap_scores, by = "filename")
+
+#relevel infection:
+umap_scores$Infection <- factor(umap_scores$Infection, levels = rev(c("NI", "Mtb")))
+return(umap_scores)
+}
+```
+
+```{r}
+library(umap)
+umap_infection_scores <- umap_scores_from_PCs(pc_infection, sample_info)
+```
+
+```{r, fig.height=6, fig.width=7}
+umap_scores <- umap_infection_scores
+
+u_time <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = Timepoint_hr, shape = Infection)) +
+  geom_point() +
+  scale_color_viridis_c(option = "rocket", trans = "log10") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+u_donor <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = self_reported_ethnicity, shape = Infection)) +
+  geom_point() +
+  scale_color_manual(values = c("orange", "steelblue")) +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+u_flow <- umap_scores %>% 
+  ggplot(aes(x = V1, y = V2, color = flow_cell, shape = Infection)) +
+  geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  scale_shape_manual(values = c(19,4)) +
+  theme_minimal() +
+  theme(text = element_text(colour = "black")) +
+  coord_equal()
+
+u_time
+u_donor
+u_flow
+
+
+rm(umap_scores)
+```
+
+There is a timepoint effect here and an ancestry effect at the end. This captures what Haley previously saw. The model is different and the way it was corrected is different but still very cool.
+
+So the next step is to use this model to capture infection effects at each timepoint. See notebook 7. 
+
+
+

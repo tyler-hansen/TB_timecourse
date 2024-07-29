@@ -1,0 +1,82 @@
+---
+title: "Assembly of Covariates for Differential Analysis with Limma-Voom"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen
+Date: 5.15.24
+
+I need to add covariates and ancestry detais to my metadata. In this notebook, I will use two metadata files that Haley compiled in the inital analyses of these data.
+
+```{r, echo=FALSE}
+library(tidyverse)
+```
+Load my sample info
+```{r}
+#sample info
+CN <- c("Donor_ID", "Timepoint", "Infection", "filename")
+sample_info <- read_tsv("data/metadata_batch1.tsv", col_names = CN)
+```
+
+Load haley's covatiate metadata
+```{r}
+# load Haley metadata
+md_haley <- read_csv("data/covariates/run1/meta_data_GOOD_SAMPLES_with_ccScores.txt")
+
+#make a new column with filename in order to join to sample info above:
+md_haley <- mutate(md_haley, filename = paste0("kallisto_", indiv_ID, "_run1"))
+```
+
+Haley's only has metadata for 361 samples, because some samples were removed. Therefore, do an inner join to simultaneously add the additional info while also removing the bad samples from my si. 
+```{r}
+#join with sample info and tidy by removing a few columns and moving filename to the first column.
+new_sample_info <- inner_join(sample_info, md_haley, by = "filename") %>% relocate(filename, .before = Donor_ID)
+
+#remove a few redundant columns
+new_sample_info <- dplyr::select(new_sample_info, -`?`, -internal_ID, -individual, -time_point, -infection_label, -time_point_hr, 
+                                 -infection, -only_AFR_admix, -only_EUR_admix, -time_infection, -timeID, -timeIDinf, -sample_ID_GE)
+```
+
+## Modify Timepoint
+Currently timepoint is a character "T4" not numeric "4". Adujust this.  
+```{r}
+new_sample_info <- mutate(new_sample_info, Timepoint_hr = as.numeric(str_remove(Timepoint, "T"))) %>%
+  relocate(Timepoint_hr, .after = Timepoint)
+```
+
+## Adjust data types of new_sample_info columns
+```{r}
+#convert flow_cell to factor:
+new_sample_info$flow_cell <- factor(new_sample_info$flow_cell, ordered = FALSE)
+
+#convert Donor_ID to factor:
+new_sample_info$Donor_ID <- factor(new_sample_info$Donor_ID, ordered = FALSE)
+
+#convert ethnicity to factor:
+new_sample_info$ethnicity <- factor(new_sample_info$ethnicity, ordered = FALSE)
+
+#convert Infection to factor:
+new_sample_info$Infection <- factor(new_sample_info$Infection, levels = c("NI", "Mtb"), ordered = FALSE)
+
+#reorder timepoint levels:
+new_sample_info$Timepoint <- factor(new_sample_info$Timepoint, levels = c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48"), ordered = FALSE)
+```
+
+Move filename to rownames
+```{r}
+new_sample_info <- column_to_rownames(new_sample_info, "filename")
+```
+
+
+## Display metadata in notebook
+```{r}
+new_sample_info
+```
+
+
+## Save as RDS object so factorization is conserved
+```{r}
+saveRDS(new_sample_info, file = "data/metadata_batch1_with-covariates.rds")
+```

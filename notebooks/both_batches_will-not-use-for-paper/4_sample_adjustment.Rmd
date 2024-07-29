@@ -1,0 +1,360 @@
+---
+title: "Adjust samples to match timpoint+infection for each donor"
+output:
+  html_document:
+    df_print: paged
+---
+Author: Tyler Hansen  
+Date: 3.15.24
+
+In order to model the data properly, we need to look at the samples and see how to match timepoint and infection for each donor. We will also remove duplicate samples and fill in missing ones by linear modeling. 
+
+## Setup 
+
+Packages
+```{r, echo=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+```
+
+Load in cts and metadata
+```{r}
+cts <- readRDS("data/filtered_counts_QCd_samples.rds")
+sample_info <- readRDS("data/metadata_with-covariates_QCd_samples.rds")
+```
+
+## Are any rows duplicates?
+```{r}
+# Show rows that are duplicates
+sample_info[duplicated(sample_info), ] %>% nrow()
+```
+
+Sweet no duplicates. 
+
+## Make a heatmap of all samples
+Facet by infection, color by run, x = donor_id, y = timepoint, value = number of samples
+
+```{r}
+#make matrix of values to plot:
+si_subset <- dplyr::select(sample_info, Donor_ID, Timepoint, Infection, Run)
+
+#reverse order of timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+
+#count number of samples, regardless of run
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+
+# Convert n to a factor
+si_subset_count$n <- factor(si_subset_count$n)
+```
+
+```{r}
+heatmap_all_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Run), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black")) +
+  ggsci::scale_fill_npg(alpha = 0.5)
+heatmap_all_samples
+```
+
+Save heatmap of all samples: 
+```{r}
+ggsave(heatmap_all_samples, filename = "results/metadata_heatmap_allGoodSamples.pdf", device = cairo_pdf(), width = 8, height = 5)
+```
+
+## Reassign Run 1 NI samples
+
+For NI run 1, assign T0 as T1 and T4 as both T3 and T5. 
+
+This code assigns T0 as T1, if the sample is NI and run1. 
+```{r}
+sample_info_reassign <- sample_info %>%
+  mutate(Timepoint = ifelse(as.character(Infection) == "NI" & as.character(Run) == "run1" & as.character(Timepoint) == "T0", "T1", as.character(Timepoint)))
+```
+
+To assign T4 to both T3 and T5, we need to first duplicate it. 
+```{r}
+duplicates_NI <- dplyr::filter(sample_info_reassign, Infection == "NI" & Run == "run1" & Timepoint == "T4") 
+
+#save rownames as rnames object to duplicate counts matrix later
+rnames <- rownames(duplicates_NI)
+
+#change rownames, so there are not duplicates
+rownames(duplicates_NI) <- paste0("duplicated_", rnames)
+```
+
+Rename T4 as T5 and add back. 
+```{r}
+duplicates_NI <- mutate(duplicates_NI, Timepoint = "T5")
+
+sample_info_reassign <- bind_rows(sample_info_reassign, duplicates_NI)
+```
+
+Using the original T4, reassigns T4 to T3, if the sample is NI and run1. 
+```{r}
+sample_info_reassign <- sample_info_reassign %>%
+  mutate(Timepoint = ifelse(Infection == "NI" & Run == "run1" & Timepoint == "T4", "T3", Timepoint))
+```
+
+
+Show this worked by making a new heatmap. 
+```{r}
+#refactor timepoint
+sample_info_reassign$Timepoint <- factor(sample_info_reassign$Timepoint, levels = c("T0","T1","T2","T3","T4","T5","T6","T7","T8","T9",
+                                                                       "T10","T12","T14","T16","T18","T24","T30","T36","T42","T48"), ordered = FALSE)
+#make matrix of values to plot:
+si_subset <- dplyr::select(sample_info_reassign, Donor_ID, Timepoint, Infection, Run)
+
+#reverse order of timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+
+#count number of samples, regardless of run
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+
+# Convert n to a factor
+si_subset_count$n <- factor(si_subset_count$n)
+
+heatmap_reassign_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Run), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black")) +
+  ggsci::scale_fill_npg(alpha = 0.5)
+heatmap_reassign_samples
+```
+
+Solid, it worked. 
+
+Now change the counts! 
+
+### Duplicate counts
+```{r}
+cts_dup <- as.data.frame(cts) 
+
+for (sample in rnames) {
+  dup_sample <- paste0("duplicated_", sample)
+  cts_dup[,dup_sample] <- cts_dup[, sample]
+  rm(dup_sample)
+}
+```
+
+This should print true, if the two match
+```{r}
+all(colnames(cts_dup) == rownames(sample_info_reassign))
+```
+
+Solid, they match. 
+
+## Drop samples
+
+### Drop AF145
+
+AF145 is missing most timepoints, so remove it. 
+
+```{r}
+sample_info_removed <- dplyr::filter(sample_info_reassign, Donor_ID != "AF145")
+```
+
+### Drop timepoints without data for all donors
+
+The following timepoints do not have data for all donors, so drop: T0, T2, T4, T6, T7, T9, T10, T14, T16, T42. 
+```{r}
+sample_info_removed <- dplyr::filter(sample_info_removed, !Timepoint %in% c("T0", "T2", "T4", "T6", "T7", "T9", "T10", "T14", "T16", "T42"))
+```
+
+### Drop duplicates
+
+With the exception of AF69, which we want to keep, the following samples are duplicated across batches:
+1. NI-AF278-T24
+2. NI-EU126-T48
+3. Mtb-AF781-T8
+4. Mtb-AF53-T3
+
+Let's see which are duplicated. 
+
+```{r}
+dup_samples <- dplyr::filter(sample_info_removed, (Infection == "NI" & Donor_ID == "AF278" & Timepoint == "T24") |
+                              (Infection == "NI" & Donor_ID == "EU126" & Timepoint == "T48") | 
+                               (Infection == "Mtb" & Donor_ID == "AF781" & Timepoint == "T8") |
+                               (Infection == "Mtb" & Donor_ID == "AF53" & Timepoint == "T3"))
+
+dplyr::arrange(dup_samples, Donor_ID)
+```
+
+So they seem to be samples that were resequenced in run4 for some reason. Since the run2 versions of these samples pass QC and their perc_X values are similar, lets keep the run2 samples and remove the run4 samples. 
+
+```{r}
+drop <- dplyr::filter(dup_samples, Run == "run4")
+
+sample_info_removed <- sample_info_removed[!(rownames(sample_info_removed) %in% rownames(drop)), ]
+```
+
+Show the removal worked by making a new heatmap. 
+```{r}
+#make matrix of values to plot:
+si_subset <- dplyr::select(sample_info_removed, Donor_ID, Timepoint, Infection, Run)
+
+#reverse order of timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+
+#count number of samples, regardless of run
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+
+# Convert n to a factor
+si_subset_count$n <- factor(si_subset_count$n)
+
+heatmap_removed_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Run), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black")) +
+  ggsci::scale_fill_npg(alpha = 0.5)
+heatmap_removed_samples
+```
+
+Save heatmap of reassigned and removed samples: 
+```{r}
+ggsave(heatmap_removed_samples, filename = "results/metadata_heatmap_reassigned+removed.pdf", device = cairo_pdf(), width = 8, height = 5)
+```
+
+
+## Fill in the missing data using nearest samples
+
+The following samples are missing (and will be filled in with the sample in parentheses): 
+1. NI - AF95 - T18 (fill in with NI - AF95 - T24)
+2. NI - EU144 - T1 (fill in with NI - EU144 - T5) (This sample will therefore be represented three times). We pick the T5 time since the duplicate_ was appended to the rowname of this one. 
+3. NI - EU262 - T36 (fill in with NI - EU262 - T30)
+4. Mtb - EU144 - T18 (fill in with Mtb -  EU144 - T16 (from original SI))
+
+First duplicate the 1-3 samples in the parentheses 
+```{r}
+fill_in_samples <- dplyr::filter(sample_info_removed, (Infection == "NI" & Donor_ID == "AF95" & Timepoint == "T24") |
+                              (Infection == "NI" & Donor_ID == "EU144" & Timepoint == "T5") | 
+                               (Infection == "NI" & Donor_ID == "EU262" & Timepoint == "T30"))
+```
+
+Get the Mtb -  EU144 - T16 sample from the original SI
+```{r}
+sample <- dplyr::filter(sample_info, Infection == "Mtb" & Donor_ID == "EU144" & Timepoint == "T16")
+
+fill_in_samples <- bind_rows(fill_in_samples, sample)
+```
+
+Now mutate each to what it will be 
+```{r}
+fill_in_samples <- mutate(fill_in_samples, Timepoint = ifelse(as.character(Infection) == "NI" & as.character(Donor_ID) == "AF95" & as.character(Timepoint) == "T24", "T18", as.character(Timepoint)))
+fill_in_samples <- mutate(fill_in_samples, Timepoint = ifelse(as.character(Infection) == "NI" & as.character(Donor_ID) == "EU144" & as.character(Timepoint) == "T5", "T1", as.character(Timepoint)))
+fill_in_samples <- mutate(fill_in_samples, Timepoint = ifelse(as.character(Infection) == "NI" & as.character(Donor_ID) == "EU262" & as.character(Timepoint) == "T30", "T36", as.character(Timepoint))) 
+fill_in_samples <- mutate(fill_in_samples, Timepoint = ifelse(as.character(Infection) == "Mtb" & as.character(Donor_ID) == "EU144" & as.character(Timepoint) == "T16", "T18", as.character(Timepoint)))
+```
+
+Append "duplicate_" to the rowname.
+```{r}
+#set here and use for counts later
+rnames <- rownames(fill_in_samples)
+
+#change rownames, so there are not duplicates
+rownames(fill_in_samples) <- paste0("duplicated_", rnames)
+```
+
+Add to sample info
+```{r}
+sample_info_filled_in <- bind_rows(sample_info_removed, fill_in_samples)
+```
+
+Show the fill-in worked by making a new heatmap. 
+```{r}
+#make matrix of values to plot:
+si_subset <- dplyr::select(sample_info_filled_in, Donor_ID, Timepoint, Infection, Run)
+
+#refactor timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = c("T1","T3","T5","T8","T12","T18","T24","T30","T36","T48"), ordered = FALSE)
+
+#reverse order of timepoint
+si_subset$Timepoint <- factor(si_subset$Timepoint, levels = rev(levels(si_subset$Timepoint)))
+
+#count number of samples, regardless of run
+si_subset_count <- count(si_subset, Donor_ID, Timepoint, Infection)
+
+# Convert n to a factor
+si_subset_count$n <- factor(si_subset_count$n)
+
+heatmap_filled_in_samples <- ggplot() +
+  geom_tile(data = si_subset, aes(x=Donor_ID, y=Timepoint, fill = Run), color = "white", size=0.2) +
+  geom_text(data = si_subset_count, aes(x=Donor_ID, y=Timepoint, label = n), size = 3) +
+  facet_wrap(~Infection) +
+  labs(fill = "Count") +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5), panel.grid = element_blank(), aspect.ratio = 0.75, axis.title.y = element_blank(), 
+        axis.title.x = element_blank(), text = element_text(colour = "black")) +
+  ggsci::scale_fill_npg(alpha = 0.5)
+heatmap_filled_in_samples
+```
+
+Great it worked. Save as pdf. 
+
+```{r}
+ggsave(heatmap_filled_in_samples, filename = "results/metadata_heatmap_reassigned+removed+filled-in.pdf", device = cairo_pdf(), width = 8, height = 5)
+```
+
+Now duplicate the rows in the counts.
+
+### Duplicate counts again
+```{r}
+cts_dup_2 <- cts_dup
+for (i in rnames) {
+  dup_i <- paste0("duplicated_", i)
+  cts_dup_2[,dup_i] <- cts_dup_2[, i]
+  rm(dup_i)
+}
+```
+
+It added 4 more rows, check this worked manually. 
+
+
+## Align Sample Info and Counts
+
+Since we removed some samples from the SI, we need to also remove them from the counts. To do this, we will simply intersect the two. 
+
+```{r}
+cts_final <- dplyr::select(cts_dup_2, intersect(colnames(cts_dup_2), row.names(sample_info_filled_in))) 
+```
+
+They have the same number of rows. Do the row/colnames match?
+
+This should print true, if the two match
+```{r}
+all(colnames(cts_final) == rownames(sample_info_filled_in))
+```
+
+Nice, they match. There are 540 samples!
+
+
+## Save modified si and cts:
+
+Change data types first:
+```{r}
+cts_final <- as.matrix(cts_final)
+
+#refactor timepoint
+sample_info_filled_in$Timepoint <- factor(sample_info_filled_in$Timepoint, levels = c("T1","T3","T5","T8","T12","T18","T24","T30","T36","T48"), ordered = FALSE)
+```
+
+
+```{r}
+#cts
+saveRDS(cts_final, file = "data/filtered_counts_final_samples.rds")
+
+#sample info
+saveRDS(sample_info_filled_in, file = "data/metadata_with-covariates_final_samples.rds")
+```
+
